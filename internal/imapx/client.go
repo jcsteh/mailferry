@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -158,6 +160,10 @@ type Client struct {
 	Trace      bool // wire trace into the mailbox log (credentials redacted)
 	Baseline   bool // RFC-3501-only: no LITERAL+, no COMPRESS
 	ReadOnly   bool // --dry-run: mutating commands are blocked at the choke point
+	// Auth, when non-nil, selects SASL bearer-token authentication
+	// (XOAUTH2 / OAUTHBEARER) instead of password LOGIN. Provider-agnostic:
+	// it only carries the mechanism, the login and a fresh-token function.
+	Auth *SASLAuth
 
 	conn     net.Conn
 	br       *bufio.Reader
@@ -182,6 +188,15 @@ type Client struct {
 	lastAct     atomic.Int64 // unix nanos of last socket activity
 	pendAppends atomic.Int32
 	watchStop   chan struct{}
+
+	// Identification evidence gathered during connection establishment.
+	// Every field here is a by-product of the normal handshake — nothing
+	// below costs an extra round trip. See identify.go.
+	idFields    map[string]string // RFC 2971 ID response (guarded by mu)
+	tlsVersion  string            // negotiated TLS version ("" = plaintext)
+	viaSTARTTLS bool              // TLS was reached by upgrading in-band
+	certCN      string            // certificate subject common name
+	certOrg     string            // certificate subject organisation
 }
 
 func NewClient(ep Endpoint, timeout time.Duration, tlsVerify bool, side SideStats,
@@ -204,10 +219,22 @@ func (c *Client) Alive() bool { return !c.closed.Load() }
 
 func (c *Client) Has(cap string) bool { return c.Caps[strings.ToUpper(cap)] }
 
+// CapabilityList returns everything the server advertised, sorted, as a copy.
+// Presentation surfaces and `auth test` use it to answer "what can this
+// server actually do?" without reaching into the client's map.
+func (c *Client) CapabilityList() []string {
+	out := make([]string, 0, len(c.Caps))
+	for k := range c.Caps {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Connect dials, upgrades TLS as configured and reads the greeting.
 func (c *Client) Connect() error {
 	c.Side.State("connect")
-	addr := fmt.Sprintf("%s:%d", c.EP.Host, c.EP.Port)
+	addr := net.JoinHostPort(c.EP.Host, strconv.Itoa(c.EP.Port))
 	d := net.Dialer{Timeout: minDur(60*time.Second, c.Timeout)}
 	var err error
 	if c.EP.Security == "ssl" {
@@ -237,12 +264,16 @@ func (c *Client) Connect() error {
 			c.setCaps(greet.Code[1:])
 		}
 	}
+	if c.EP.Security == "ssl" {
+		c.captureTLS(false)
+	}
 	if c.EP.Security == "tls" {
 		c.Side.State("tls")
 		if err := c.starttls(); err != nil {
 			c.Abort(err)
 			return err
 		}
+		c.captureTLS(true)
 	}
 	go c.readerLoop()
 	go c.watchdog()
@@ -624,7 +655,14 @@ func quoteIMAP(s string) string {
 	return `"` + s + `"`
 }
 
+// Login authenticates the connection. It dispatches on the configured
+// mechanism: SASL bearer-token (XOAUTH2 / OAUTHBEARER) when Auth is set,
+// otherwise classic password LOGIN. The engine calls this uniformly and
+// never needs to know which mechanism (or which OAuth provider) is in use.
 func (c *Client) Login() error {
+	if c.Auth != nil {
+		return c.authenticateSASL()
+	}
 	c.Side.State("auth")
 	_, err := c.Cmd("LOGIN", quoteIMAP(c.EP.User)+" "+quoteIMAP(c.EP.Password))
 	if err != nil {
@@ -633,8 +671,13 @@ func (c *Client) Login() error {
 	if len(c.Caps) == 0 {
 		c.Cmd("CAPABILITY", "")
 	}
-	c.Cmd("ID", fmt.Sprintf(`("name" %s "version" %s)`,
-		quoteIMAP(identity.Product), quoteIMAP(identity.Version)))
+	// RFC 2971 ID: MailFerry introduces itself, and the server's reply is
+	// kept as the strongest identification evidence (see identify.go). The
+	// command was already being issued — only the response is new.
+	if res, err := c.Cmd("ID", fmt.Sprintf(`("name" %s "version" %s)`,
+		quoteIMAP(identity.Product), quoteIMAP(identity.Version)), "ID"); err == nil {
+		c.captureID(res)
+	}
 	c.Side.State("ready")
 	return nil
 }

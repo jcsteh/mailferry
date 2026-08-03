@@ -44,12 +44,12 @@ operation (or explicit `mailferry config`) — see [section 5](#5-where-mailferr
 
 ## 3. macOS Gatekeeper
 
-**For this release candidate specifically:** the v2.0.0-rc.3 macOS
-binaries are not yet Apple-notarised, so Gatekeeper may block the first
-launch. This is expected for this release candidate and is not a
-limitation of Go or of MailFerry. (This note describes rc.2; it is easy
-to update once a future release is signed and notarised — don't assume
-every future version behaves this way.)
+**Current releases (v2.1.0 included):** MailFerry's macOS binaries are
+not yet Apple-notarised — the Developer ID signing pipeline is documented
+in docs/RELEASING-MACOS.md and planned for a future release — so
+Gatekeeper may block the first launch. This is expected and is not a
+limitation of Go or of MailFerry; this note will be removed once releases
+are signed and notarised.
 
 If macOS blocks the first launch, here is the exact procedure:
 

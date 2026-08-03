@@ -141,6 +141,37 @@ func (m *Model) mailboxesView(w, h int) string {
 	return b.String()
 }
 
+// notableCapabilities are the extensions that actually change how MailFerry
+// migrates, or that an operator plans around. A server advertises far more
+// than this; listing everything on the Dashboard would be protocol noise, so
+// the detail row shows these and `mailferry auth test` shows the full set.
+var notableCapabilities = []string{
+	"MULTIAPPEND", "UIDPLUS", "MOVE", "LITERAL+", "COMPRESS=DEFLATE",
+	"CONDSTORE", "QRESYNC", "IDLE", "NAMESPACE", "SPECIAL-USE", "ESEARCH",
+}
+
+// notableCaps renders the notable subset a server advertised, in a fixed
+// order so the row does not reshuffle between refreshes.
+func notableCaps(advertised []string) string {
+	if len(advertised) == 0 {
+		return ""
+	}
+	have := make(map[string]bool, len(advertised))
+	for _, c := range advertised {
+		have[strings.ToUpper(c)] = true
+	}
+	var out []string
+	for _, c := range notableCapabilities {
+		if have[c] {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
 func (m *Model) mailboxDetail(mb engine.MBValues, w int) string {
 	var b strings.Builder
 	line := func(s string) { b.WriteString(cDim.Render("      "+clip(s, w-6)) + "\n") }
@@ -149,6 +180,10 @@ func (m *Model) mailboxDetail(mb engine.MBValues, w int) string {
 	line(fmt.Sprintf("Destination %s [%s] %s ↑%s  pre-existing %d  new %d  adopted %d",
 		mb.Dst.Host, strings.Join(mb.Dst.Caps, ","), mb.Dst.ConnState,
 		util.FmtBytes(float64(mb.Dst.TXBytes)), mb.Dst.Existing, mb.Appended, mb.Adopted))
+	line("MULTIAPPEND " + mb.MA.Detail())
+	if caps := notableCaps(mb.Dst.Advertised); caps != "" {
+		line("Dst caps    " + caps)
+	}
 	if mb.Op != "" {
 		line("Operation   " + mb.Op)
 	}
@@ -293,60 +328,7 @@ func (m *Model) historyView(w, h int) string {
 }
 
 // ------------------------------------------------------------- errors --
-
-func (m *Model) errorsView(w, h int) string {
-	errs := m.errorRows()
-	var b strings.Builder
-	head := fmt.Sprintf(" ERRORS & WARNINGS — %d recorded", len(errs))
-	if q := m.viewSearch(vErrors); q != "" {
-		head += "   /" + q
-	}
-	b.WriteString(cBold.Render(head) + "\n\n")
-	// After completion this view doubles as the Failed Messages browser:
-	// the outstanding registry entries, subjects decoded for humans.
-	if m.results != nil && len(m.results.Res.FailedRegistry) > 0 {
-		rows := m.results.Res.FailedRegistry
-		b.WriteString(cRed.Render(fmt.Sprintf(" FAILED MESSAGE REGISTRY — %d outstanding", len(rows))) + "\n")
-		lim := len(rows)
-		if avail := (h - 6 - min(len(errs), 5)); lim > avail && avail >= 3 {
-			lim = avail
-		}
-		for _, r := range rows[:lim] {
-			b.WriteString(fmt.Sprintf("  %-22s %-12s UID %-6d %-9s %s\n",
-				clip(r.Mailbox, 22), clip(r.Folder, 12), r.SrcUID,
-				util.FmtBytes(float64(r.Size)), r.FType))
-			b.WriteString(cDim.Render(fmt.Sprintf("      %s · %s\n",
-				util.DecodeEllipsize(orEmpty(r.Subject), 56), util.Ellipsize(r.Reason, w-70))))
-		}
-		if lim < len(rows) {
-			b.WriteString(cDim.Render(fmt.Sprintf("  … +%d more — mailferry failed\n", len(rows)-lim)))
-		}
-		b.WriteString("\n")
-	}
-	if len(errs) == 0 {
-		b.WriteString(cGreen.Render("  no errors recorded — all clear") + "\n")
-		return b.String()
-	}
-	if m.errSel >= len(errs) {
-		m.errSel = len(errs) - 1
-	}
-	vh := h - 3
-	top := 0
-	if m.errSel >= vh {
-		top = m.errSel - vh + 1
-	}
-	for i := top; i < len(errs) && i < top+vh; i++ {
-		e := errs[i]
-		cursor := "  "
-		if i == m.errSel {
-			cursor = cCyan.Render("▸ ")
-		}
-		b.WriteString(cursor + sevStyle(e.Severity).Render(fmt.Sprintf("%s  %-5s %-24s %s",
-			e.TS.Format("15:04:05"), e.Severity, clip(e.Mailbox, 24),
-			clip(e.Message, w-44))) + "\n")
-	}
-	return b.String()
-}
+// (the F6 master/detail view lives in errors.go)
 
 // -------------------------------------------------------- performance --
 
@@ -427,6 +409,17 @@ func (m *Model) performanceView(w, h int) string {
 		agg.Adopted, agg.SkippedMsgs, agg.FailedMsgs))
 	b.WriteString(fmt.Sprintf("  Stalls      detected %d · recovered %d · failed %d\n",
 		s[0], s[1], s[2]))
+	// Transport optimisation: what batching is actually achieving. Kept to
+	// two lines — this is a performance view, not a protocol trace.
+	ma := m.snap.MultiAppend()
+	b.WriteString("  MULTIAPPEND " + ma.State() + "\n")
+	if ma.Commands > 0 {
+		saved := ma.Messages - ma.Commands
+		b.WriteString(fmt.Sprintf("              %d message(s) in %d append command(s) · "+
+			"avg %.1f/cmd · last %d · %d round trip(s) saved\n",
+			ma.Messages, ma.Commands, float64(ma.Messages)/float64(ma.Commands),
+			ma.LastBatch, saved))
+	}
 	return b.String()
 }
 
@@ -495,22 +488,7 @@ func (m *Model) logsView(w, h int) string {
 }
 
 // ----------------------------------------------------------- settings --
-
-func (m *Model) settingsView(w, h int) string {
-	var b strings.Builder
-	b.WriteString(cBold.Render(" SETTINGS") + "\n\n")
-	paused := "running"
-	if m.bus.Paused {
-		paused = cYellow.Render("PAUSED")
-	}
-	b.WriteString("  Migration   " + paused + "  (p pauses / resumes from any view)\n")
-	b.WriteString(fmt.Sprintf("  Refresh     %v (display only — engine unaffected)\n", m.refresh))
-	b.WriteString(fmt.Sprintf("  Run         %s · State Database %s\n", m.snap.CSVFile, m.snap.DBPath))
-	b.WriteString(fmt.Sprintf("  Logs        %s\n", m.snap.LogsDir))
-	b.WriteString(fmt.Sprintf("  Cluster     worker %s · %d worker(s) on this State Database\n",
-		m.bus.WorkerID, len(m.bus.ClusterSnapshot())))
-	return b.String()
-}
+// (the interactive F9 Settings editor lives in settings.go)
 
 // -------------------------------------------------------------- help --
 

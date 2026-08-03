@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ajsap/mailferry/v2/internal/config"
 	"github.com/ajsap/mailferry/v2/internal/engine"
 	"github.com/ajsap/mailferry/v2/internal/state"
 	"github.com/charmbracelet/lipgloss"
@@ -27,14 +28,35 @@ import (
 // synthetic fixture data (RFC-2606 example domains only). Views:
 // dashboard, workers, history, logs, results-success, results-warnings,
 // results-nothing.
-func RenderShot(view string) string {
+// ShotCols / ShotRows are the canonical screenshot dimensions.
+const ShotCols, ShotRows = 124, 33
+
+func RenderShot(view string) string { return RenderShotSize(view, ShotCols, ShotRows) }
+
+// RenderShotSize renders a view at a specific terminal size. Layout has to
+// hold up in a cramped SSH window as well as on a wide desktop, so both the
+// screenshot tool and the layout tests drive it through here rather than
+// each inventing their own harness.
+func RenderShotSize(view string, cols, rows int) string {
 	lipgloss.SetColorProfile(termenv.ANSI256)
+	now := time.Now()
+	stats := shotStats(now)
+
+	bus := engine.NewBus()
+	bus.WorkerID = "ferry:70210:a1b2c3d4"
+	return renderShotWith(view, stats, bus, now, cols, rows)
+}
+
+// shotStats builds the synthetic fixture the screenshot views render from.
+// It is a named function so tests can assert that a view displays what the
+// ENGINE reports, rather than re-hard-coding expected presentation strings
+// that would drift the moment the wording changed.
+func shotStats(now time.Time) *engine.Stats {
 	stats := engine.NewStats()
 	stats.CSVFile = "mailboxes.csv"
 	stats.DBPath = "./mailferry.db"
 	stats.LogsDir = "./logs"
 	stats.Workers = 4
-	now := time.Now()
 
 	type fix struct {
 		label, status, op string
@@ -72,16 +94,32 @@ func RenderShot(view string) string {
 			m.Src.Host, m.Dst.Host = "imap.example.com", "imap.example.net"
 			m.Src.ConnState, m.Dst.ConnState = "ready", "ready"
 			m.Src.Caps = []string{"SSL", "UID+", "LIT+", "ZIP"}
-			m.Dst.Caps = []string{"SSL", "UID+", "LIT+"}
+			m.Dst.Caps = []string{"SSL", "UID+", "LIT+", "MA"}
+			m.Src.Advertised = []string{"IMAP4REV1", "IDLE", "LITERAL+", "MOVE",
+				"NAMESPACE", "UIDPLUS", "COMPRESS=DEFLATE"}
+			m.Dst.Advertised = []string{"IMAP4REV1", "CONDSTORE", "IDLE", "LITERAL+",
+				"MOVE", "MULTIAPPEND", "NAMESPACE", "QRESYNC", "SPECIAL-USE", "UIDPLUS"}
+			m.MA = engine.MAValues{Enabled: true, BatchLabel: "auto", Probed: true,
+				Supported: true, Commands: 61 + int64(i*7), Messages: 478 + int64(i*55),
+				LastBatch: 8}
+			// Identification as it would be learned from the live
+			// connections — self-reported product names, never hostnames.
+			m.Src.Server, m.Src.ServerVersion = "Dovecot", "2.3.21"
+			m.Dst.Server, m.Dst.ServerVersion = "Axigen", "10.3"
+			m.Src.Security, m.Dst.Security = "TLS 1.3", "STARTTLS → TLS 1.2"
+			m.Src.Auth, m.Dst.Auth = "OAuth (Microsoft)", "Password"
 			m.Src.RXBytes = st.bdone + st.bdone/9
 			m.Dst.TXBytes = st.bdone + st.bdone/8
 			m.Folder = "INBOX"
 		})
 	}
 	stats.BatchStart = now.Add(-92 * time.Minute)
+	return stats
+}
 
-	bus := engine.NewBus()
-	bus.WorkerID = "ferry:70210:a1b2c3d4"
+// renderShotWith renders one view from a prepared fixture at a given size.
+func renderShotWith(view string, stats *engine.Stats, bus *engine.Bus, now time.Time,
+	cols, rows int) string {
 	bus.SetCluster([]engine.WorkerInfo{
 		{ID: "ferry:70210:a1b2c3d4", Host: "ferry.local", Status: "WORKING",
 			Active: 2, Heartbeat: now.Add(-3 * time.Second), HBAge: 3,
@@ -140,17 +178,89 @@ func RenderShot(view string) string {
 
 	done := make(chan struct{})
 	m := New(stats, bus, func() {}, func() {}, 250*time.Millisecond, done)
-	m.width, m.height = 124, 33
+	m.width, m.height = cols, rows
 	m.snap = stats.Snapshot()
 	m.lastRates = [2]float64{9.4 * 1024 * 1024, 41}
 	switch view {
 	case "workers":
 		m.active = vWorkers
+	case "dashboard-mixed":
+		// A heterogeneous MSP run: several source platforms in one batch, so
+		// the connection panel switches to the aggregated per-platform form.
+		platforms := []struct{ name, ver, host string }{
+			{"Exchange Online", "15.20", "t1.example.com"},
+			{"Exchange Online", "15.20", "t2.example.com"},
+			{"Exchange Online", "15.20", "t2.example.com"},
+			{"Dovecot", "2.3.21", "dc.example.org"},
+			{"Dovecot", "2.3.21", "dc.example.org"},
+			{"SmarterMail", "", "sm.example.org"},
+			{"", "", "old.example.org"}, // declined to identify itself
+			{"Dovecot", "2.3.21", "dc2.example.org"},
+		}
+		for i, mb := range m.snap.Mailboxes {
+			p := platforms[i%len(platforms)]
+			stats.Mailbox(mb.Index, mb.Label, "", "", "").Set(func(v *engine.MBValues) {
+				v.Src.Host, v.Src.Server, v.Src.ServerVersion = p.host, p.name, p.ver
+				if p.name == "Exchange Online" {
+					v.Src.Auth = "OAuth (Microsoft)"
+				}
+			})
+		}
+		m.snap = stats.Snapshot()
+		m.active = vDashboard
+	case "dashboard-complete":
+		// The Dashboard AFTER the run: Runtime frozen, completion time from
+		// the engine's authoritative FinishedAt. The fixture's start is
+		// pinned to that instant minus the run duration so the frozen
+		// Runtime is the real arithmetic rather than a coincidence.
+		finalizeShotStats(stats, "results-success", now)
+		m.results = shotResult("results-success")
+		stats.BatchStart = m.results.Res.FinishedAt.Add(
+			-time.Duration(m.results.Runtime) * time.Second)
+		m.snap = stats.Snapshot()
+		m.finished = true
+		m.active = vDashboard
+	case "mailboxes":
+		// F3 with a running mailbox selected, so the expanded detail row —
+		// including the destination's MULTIAPPEND state and notable
+		// capabilities — is part of the captured frame.
+		m.active = vMailboxes
+		m.mailSel = 3
+	case "performance":
+		m.active = vPerformance
 	case "history":
 		m.active = vHistory
 	case "logs":
 		m.active = vLogs
-	case "results-success", "results-warnings", "results-nothing":
+	case "errors", "errors-mixed":
+		finalizeShotStats(stats, "results-warnings", now)
+		m.snap = stats.Snapshot()
+		m.finished = true
+		m.results = shotResult("results-warnings")
+		if view == "errors-mixed" {
+			shotRunErrors(bus) // mixed: run-level errors AND registry entries
+		} else {
+			// registry-only: a fresh bus with no run-level errors, so the
+			// view shows the honest "no run-level errors recorded" wording
+			// beside the outstanding Failed Message Registry.
+			m.bus = engine.NewBus()
+			m.bus.WorkerID = "ferry:70210:a1b2c3d4"
+		}
+		m.active = vErrors
+	case "settings":
+		m.snap = stats.Snapshot()
+		m.settings = shotSettings()
+		m.active = vSettings
+	case "settings-edit":
+		m.snap = stats.Snapshot()
+		m.settings = shotSettings()
+		m.active = vSettings
+		// pre-stage an edit so the capture shows the unsaved-change state
+		if o, ok := config.FindOption("migration.parallel_mailboxes"); ok {
+			m.stagePending(o, "20")
+		}
+		m.set.sel = 0
+	case "results-success", "results-warnings", "results-nothing", "results-dryrun":
 		finalizeShotStats(stats, view, now)
 		m.snap = stats.Snapshot()
 		m.finished = true
@@ -160,9 +270,59 @@ func RenderShot(view string) string {
 	default:
 		m.active = vDashboard
 	}
+	primeShotRates(m)
 	frame := m.View()
 	m.stopSysmon()
 	return frame
+}
+
+// primeShotRates feeds the PER-CONNECTION rate trackers two samples so the
+// screenshots show real throughput figures instead of dashes. A rate needs
+// two observations by definition, and a single fixture snapshot cannot
+// produce one.
+//
+// Only the per-side trackers are touched: the fixture sets the run-wide rate
+// and message rate deliberately, and driving those through the sampler would
+// overwrite curated figures with arithmetic from synthetic byte counts.
+func primeShotRates(m *Model) {
+	const srcPerSec, dstPerSec = 12 << 20, 11 << 20 // ~12 / ~11 MB per second
+	then := m.snap.TS.Add(-time.Second)
+	for _, mb := range m.snap.Mailboxes {
+		if mb.Status != "RUNNING" && mb.Status != "RETRYING" {
+			continue // an idle connection genuinely has no throughput
+		}
+		if m.mbSrcWire[mb.Index] == nil {
+			m.mbSrcWire[mb.Index] = engine.NewRateTracker()
+			m.mbDstWire[mb.Index] = engine.NewRateTracker()
+		}
+		if m.mbWire[mb.Index] == nil {
+			m.mbWire[mb.Index] = engine.NewRateTracker()
+			m.mbPay[mb.Index] = engine.NewRateTracker()
+		}
+		src := mb.Src.RXBytes + mb.Src.TXBytes
+		dst := mb.Dst.RXBytes + mb.Dst.TXBytes
+		m.mbSrcWire[mb.Index].Update(then, sub0(src, srcPerSec), 0)
+		m.mbSrcWire[mb.Index].Update(m.snap.TS, src, 0)
+		m.mbDstWire[mb.Index].Update(then, sub0(dst, dstPerSec), 0)
+		m.mbDstWire[mb.Index].Update(m.snap.TS, dst, 0)
+		// The per-mailbox Speed column reads mbWire/mbPay; prime them with
+		// the same story so the table and the connection panel agree — a
+		// screenshot showing 0 B/s rows under a 36 MB/s panel would look
+		// like a bug, and would be one.
+		w := src
+		if dst > w {
+			w = dst
+		}
+		m.mbWire[mb.Index].Update(then, sub0(w, srcPerSec), 0)
+		m.mbWire[mb.Index].Update(m.snap.TS, w, 0)
+	}
+}
+
+func sub0(v, d int64) int64 {
+	if v < d {
+		return 0
+	}
+	return v - d
 }
 
 // finalizeShotStats converts the live fixture into a finished batch for
@@ -184,6 +344,15 @@ func finalizeShotStats(stats *engine.Stats, view string, now time.Time) {
 				v.Start = now.Add(-time.Duration(80+i*9) * time.Minute)
 			}
 			v.End = now.Add(-time.Duration(i) * time.Minute)
+			if view == "results-dryrun" {
+				// Dry run: every message WOULD be copied — counted as Planned,
+				// nothing appended/adopted. Identity: done = planned.
+				v.Appended, v.Adopted, v.Planned = 0, 0, v.MsgsTotal
+				v.MsgsDone = v.MsgsTotal
+				v.Src.RXBytes = int64(40<<10 + i*11<<10)
+				v.Dst.TXBytes = 0 // dry run writes nothing to the destination
+				return
+			}
 			switch view {
 			case "results-nothing":
 				v.Appended, v.Adopted = 0, v.MsgsTotal
@@ -217,19 +386,45 @@ func maxI(a, b int) int {
 	return b
 }
 
+// shotSettings builds a fictional F9 editor context (RFC-2606 data only).
+func shotSettings() *SettingsCtx {
+	cfg := config.Defaults()
+	cfg.CSVFile = "mailboxes.csv"
+	return &SettingsCtx{
+		Cfg:        cfg,
+		ConfigPath: "~/Library/Application Support/MailFerry/mailferry.toml",
+		CLISet:     map[string]bool{"network.timeout_seconds": true},
+	}
+}
+
+// shotRunErrors injects a couple of run-level errors so the F6 capture can
+// show run-level Errors & Warnings alongside the Failed Message Registry.
+func shotRunErrors(bus *engine.Bus) {
+	bus.Log("WARN", "user4@example.org", "src: stalled — connection recovery 1/3")
+	bus.Log("ERROR", "user3@example.org", "Archive UID 4188 failed permanently: CONNECTION_RESET")
+}
+
 // shotResult builds the fixture ResultMsg for the Results screenshots.
 func shotResult(view string) *ResultMsg {
+	// A fixed fictional completion instant keeps the screenshots and the
+	// render tests deterministic (never "now").
+	finishedAt := time.Date(2026, 7, 18, 10, 42, 17, 0, time.Local)
 	r := &ResultMsg{
 		RunID:      "20260718-093012-4f2a",
 		WorkerID:   "ferry:70210",
 		ResultsCSV: "./logs/results.csv",
 		SessionLog: "./logs/session.log",
 		Runtime:    5520,
-		Res:        engine.RunResult{Counts: map[string]int{}},
+		Res:        engine.RunResult{Counts: map[string]int{}, FinishedAt: finishedAt},
 	}
 	switch view {
 	case "results-nothing":
 		r.Runtime = 9
+	case "results-dryrun":
+		r.Runtime = 14
+		r.DryRun = true
+		r.Modes = []string{"Dry Run", "Date Range"}
+		r.RangeLabel = "2026-07-01 → 2026-07-18"
 	case "results-warnings":
 		r.FailedCSV = "./logs/failed_messages.csv"
 		r.Res.Outstanding = 8

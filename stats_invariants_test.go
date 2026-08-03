@@ -53,10 +53,10 @@ func (h *harness) runFull(mutate func(*config.Run)) engine.RunResult {
 	}}
 	h.stats = engine.NewStats()
 	res, err := engine.RunMigration(context.Background(), cfg, specs, h.stats,
-		func(s string) { h.sessions = append(h.sessions, s) },
+		h.logLine,
 		func(config.MailboxSpec) func(string, ...any) {
 			return func(format string, a ...any) {
-				h.sessions = append(h.sessions, fmt.Sprintf(format, a...))
+				h.logLine(fmt.Sprintf(format, a...))
 			}
 		})
 	if err != nil {

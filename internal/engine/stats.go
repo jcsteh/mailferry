@@ -28,6 +28,34 @@ type SideValues struct {
 	Reconnects int64
 	RXBytes    int64
 	TXBytes    int64
+	// Advertised is the server's full CAPABILITY list, sorted, captured once
+	// per connection. Caps above stays the short badge row; this is the
+	// detail an operator wants when asking "can this server do X?".
+	Advertised []string
+	// Server is what the server said it is — derived ONLY from evidence it
+	// volunteered on the live connection (RFC 2971 ID, TLS certificate,
+	// greeting, vendor-private capabilities), never from the hostname.
+	// Empty means it could not be positively identified; render "Unknown".
+	Server string
+	// ServerVersion is the self-reported version, when one was offered.
+	ServerVersion string
+	// Security is the negotiated transport: "TLS 1.3", "STARTTLS → TLS 1.2"
+	// or "none".
+	Security string
+	// Auth describes how this endpoint authenticated, e.g. "OAuth
+	// (Microsoft)" or "Password".
+	Auth string
+}
+
+// ServerLabel renders the identification for display.
+func (s SideValues) ServerLabel() string {
+	if s.Server == "" {
+		return "Unknown"
+	}
+	if s.ServerVersion != "" {
+		return s.Server + " " + s.ServerVersion
+	}
+	return s.Server
 }
 
 type MBValues struct {
@@ -65,6 +93,9 @@ type MBValues struct {
 	Src       SideValues
 	Dst       SideValues
 	LogPath   string
+	// MA is the MULTIAPPEND capability/activity picture for this mailbox —
+	// telemetry only, never part of the accounting identity.
+	MA MAValues
 }
 
 type MBStats struct {

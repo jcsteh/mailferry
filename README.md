@@ -12,7 +12,7 @@ binary speaks IMAP directly to both servers, streams messages
 source-to-destination with bounded memory, and records per-message state
 in an SQLite database so every run is resumable and duplicate-free.
 
-> **Release status: `v2.0.3` (stable).**
+> **Release status: `v2.1.0` (latest stable).**
 > v1.0.0 was the original Python implementation; development continued
 > unreleased after it and served as the behavioural reference for the
 > complete native Go rewrite that is v2, released as stable v2.0.0
@@ -27,6 +27,15 @@ in an SQLite database so every run is resumable and duplicate-free.
 - **Licence:** GNU AGPL v3.0
 
 ![MailFerry TUI dashboard](docs/img/tui-dashboard.png)
+
+The Source / Destination panel reports what MailFerry **learned from the
+live connections** — server product and version, how each side
+authenticated, the negotiated TLS version and that connection's current
+throughput. When one batch spans several platforms (an MSP migration, say)
+the panel aggregates by identified platform rather than showing one
+mailbox's details as if they spoke for the run:
+
+![Dashboard with a heterogeneous run](docs/img/tui-dashboard-mixed.png)
 
 A migration finishes on a native **Results screen** — verdict, run and
 message statistics, per-mailbox outcomes and a concise "Needs
@@ -95,9 +104,39 @@ Go engine reached feature parity with it before this RC (see
   detach and re-attach freely — workers are never disturbed
 - **`--portable`** — self-contained mode: configuration, State
   Database, logs and cache live beside the executable
+- **OAuth 2.0 / modern authentication** (SASL XOAUTH2 / OAUTHBEARER) —
+  first-class **Microsoft 365 / Exchange Online** and **Google Workspace
+  / Gmail**, plus a generic provider for other standards-compliant OAuth
+  IMAP servers. A first-class `mailferry auth` lifecycle authorises in the
+  browser (loopback + PKCE) or headlessly (Microsoft device code), stores
+  the token in your **OS keychain**, and needs no tokens pasted into the
+  CSV. **Bulk/MSP models** authenticate many mailboxes from one profile:
+  Microsoft 365 app-only (`IMAP.AccessAsApp`) and Google Workspace
+  domain-wide delegation. Password and OAuth endpoints interoperate in one
+  run; access tokens refresh automatically across long migrations. The
+  canonical CSV is unchanged (an endpoint opts in with an `oauth:<profile>`
+  password cell); **secrets are never stored** — they are external
+  references (`env:`/`file:`/`keychain:`/`cmd:`) resolved at run time and
+  never written to the State Database, logs, reports or traces. See
+  [docs/OAUTH.md](docs/OAUTH.md) for the model, and
+  [docs/OAUTH-SETUP.md](docs/OAUTH-SETUP.md) for step-by-step Microsoft Entra
+  and Google Cloud configuration.
+- **MULTIAPPEND (RFC 3502)** — several messages uploaded in one IMAP append
+  command when the destination supports it, on by default with automatic
+  batch sizing. Purely an optimisation: bodies still stream (memory stays
+  proportional to a chunk, not a batch), a server without the capability
+  transparently uses one append per message, and every message keeps its own
+  durable state, destination UID, flags and INTERNALDATE. On the built-in
+  benchmark, 400 messages went from 400 append commands to 50. Batch size is
+  **not** concurrency — see [docs/MULTIAPPEND.md](docs/MULTIAPPEND.md).
+- **Interactive F9 Settings** — browse and edit configuration in the TUI,
+  saved atomically to `mailferry.toml` (comments preserved, validated
+  before write, secrets never persisted).
 
-**Planned for v2.1.0**: OAuth 2.0 (XOAUTH2/OAUTHBEARER), MULTIAPPEND,
-QRESYNC delta sync, permanent quarantine purge.
+![F9 Settings editor](docs/img/tui-settings.png)
+
+**Planned for the v2.1.x line**: QRESYNC/CONDSTORE delta sync, permanent
+quarantine purge, Prometheus-style metrics.
 
 ## Installation
 
@@ -107,19 +146,19 @@ checksum, make it executable, run it. There is nothing else to install.
 
 ```sh
 shasum -a 256 -c SHA256SUMS          # verify (macOS: shasum, Linux: sha256sum)
-chmod +x mailferry-v2.0.3-darwin-arm64
-./mailferry-v2.0.3-darwin-arm64 version
+chmod +x mailferry-v2.1.0-darwin-arm64
+./mailferry-v2.1.0-darwin-arm64 version
 ```
 
 Targets: `darwin-arm64` (all Apple Silicon), `darwin-amd64` (Intel Macs),
 `linux-amd64`, `linux-arm64`, `windows-amd64.exe`, `windows-arm64.exe`.
 
-> **macOS Gatekeeper:** this release candidate's macOS binaries are not
-> yet Apple-notarised, so Gatekeeper may block the first launch — a
-> one-time **Open Anyway** approval is expected for this RC. Follow the
-> step-by-step guide in
-> [docs/INSTALLATION-MACOS.md](docs/INSTALLATION-MACOS.md); never disable
-> Gatekeeper.
+> **macOS Gatekeeper:** MailFerry's macOS binaries are not yet
+> Apple-notarised (the signing pipeline is planned — see
+> docs/RELEASING-MACOS.md), so Gatekeeper may block the first launch and a
+> one-time **Open Anyway** approval is expected. Follow the step-by-step
+> guide in [docs/INSTALLATION-MACOS.md](docs/INSTALLATION-MACOS.md); never
+> disable Gatekeeper.
 
 Building from source instead: Go 1.22+, then `go build ./cmd/mailferry`
 from the repository root — or `./build.sh` for all six release targets
@@ -161,6 +200,8 @@ passwords into its State Database, logs or reports.
 --sync-flags           re-apply changed flags to already-synced mail
 --order csv|size       admission order
 --compress auto|off    COMPRESS=DEFLATE (default auto)
+--multiappend auto|off            batched IMAP appends (default auto)
+--multiappend-batch-size auto|N   messages per append command (NOT --workers)
 --no-tui               headless output   --trace  redacted protocol trace
 ```
 
@@ -214,11 +255,26 @@ dashboard (per-mailbox progress, wire-speed, ETA, warnings) plus nine
 more views on **F1–F10** — Workers (cluster), Mailboxes, Queue,
 History/Activity, Errors, Performance, Logs, Settings, Help. Digits
 **1–0** mirror the F-keys for terminals that intercept them. `Enter`
-opens details, `/` searches, `p` pauses, `r`/`R` retries failed
-mailboxes, `u` picks up rows newly added to the CSV, `Space` freezes the
-display, `F8` logs follow like `tail -f` (scroll to browse, `F` to
-re-follow). `Ctrl+C` opens the graceful-shutdown dialog; a second
-`Ctrl+C` forces an immediate exit with state intact.
+opens a **live mailbox inspector** that keeps updating while it is open,
+`/` searches, `p` pauses, `r`/`R` retries failed mailboxes, `u` picks up
+rows newly added to the CSV, `Space` freezes the display, `F8` logs
+follow like `tail -f` (scroll to browse, `F` to re-follow).
+
+![Mailboxes view with the live inspector](docs/img/tui-mailboxes.png)
+
+The Dashboard also shows what MailFerry **learned from the live
+connection** about each side — server product and version, how it
+authenticated, and the negotiated transport — identified only from what
+the server said about itself (RFC 2971 ID, TLS certificate, greeting,
+vendor-private capabilities). There is no hostname table and no bundled
+provider list; an unidentifiable server is shown as `Unknown` rather
+than guessed at.
+
+**Quitting always confirms.** `q` and `Ctrl+C` both raise the same
+dialog, which explains that completed work is already recorded and the
+run resumes exactly where it stopped. `Esc` means *back* and never exits
+MailFerry. A second `Ctrl+C` starts the graceful stop and a third forces
+an immediate exit with state intact.
 
 ![History / Activity view](docs/img/tui-history.png)
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,7 +78,27 @@ type harness struct {
 	dir      string
 	cfg      *config.Run
 	stats    *engine.Stats
+
+	// sessions is appended to by the engine's log callbacks, which run on
+	// several goroutines at once (a mailbox opens its source and destination
+	// connections in parallel), so it needs its own lock. Write through
+	// logLine; read through logLines.
+	sessMu   sync.Mutex
 	sessions []string
+}
+
+// logLine records one engine log line from whichever goroutine produced it.
+func (h *harness) logLine(s string) {
+	h.sessMu.Lock()
+	h.sessions = append(h.sessions, s)
+	h.sessMu.Unlock()
+}
+
+// logLines returns a snapshot of everything logged so far.
+func (h *harness) logLines() []string {
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	return append([]string(nil), h.sessions...)
 }
 
 func newHarness(t *testing.T, srcA, dstA *fakeimap.Account) *harness {
@@ -95,6 +116,12 @@ func newHarness(t *testing.T, srcA, dstA *fakeimap.Account) *harness {
 }
 
 func (h *harness) run(mutate func(*config.Run)) map[string]int {
+	return h.runSpec(mutate, nil)
+}
+
+// runSpec is run with an additional hook for adjusting the mailbox spec —
+// used by tests that need a non-password endpoint.
+func (h *harness) runSpec(mutate func(*config.Run), spec func(*config.MailboxSpec)) map[string]int {
 	cfg := config.Defaults()
 	cfg.CSVFile = "test.csv"
 	cfg.DBPath = filepath.Join(h.dir, "migration.db")
@@ -115,14 +142,17 @@ func (h *harness) run(mutate func(*config.Run)) map[string]int {
 		Dst: config.Endpoint{Host: "127.0.0.1", Port: h.dst.Port(), Security: "none",
 			User: h.dstA.User, Password: h.dstA.Password},
 	}}
+	if spec != nil {
+		spec(&specs[0])
+	}
 	h.stats = engine.NewStats()
 	logf := func(spec config.MailboxSpec) func(string, ...any) {
 		return func(format string, a ...any) {
-			h.sessions = append(h.sessions, fmt.Sprintf(format, a...))
+			h.logLine(fmt.Sprintf(format, a...))
 		}
 	}
 	res, err := engine.RunMigration(context.Background(), cfg, specs, h.stats,
-		func(s string) { h.sessions = append(h.sessions, s) }, logf)
+		h.logLine, logf)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -130,7 +160,7 @@ func (h *harness) run(mutate func(*config.Run)) map[string]int {
 }
 
 func (h *harness) logContains(sub string) bool {
-	for _, l := range h.sessions {
+	for _, l := range h.logLines() {
 		if strings.Contains(l, sub) {
 			return true
 		}

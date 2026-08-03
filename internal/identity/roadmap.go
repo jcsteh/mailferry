@@ -25,20 +25,31 @@ var Roadmap = []struct{ Version, Status, Summary string }{
 			"stall recovery, failed-message isolation with a persistent registry and " +
 			"COMPLETED WITH WARNINGS, multi-instance clustering with failover, live " +
 			"wire-speed metering, mailferry.toml."},
-	{"v2.0.0", "next",
+	{"v2.0.0", "done",
 		"Complete architectural rewrite in Go: single static cross-platform " +
 			"binary (macOS/Linux/Windows, arm64+amd64), goroutine-based concurrent " +
 			"engine, plus destination deduplication and date-range migration modes. " +
 			"Released only after full feature parity with the Python reference."},
-	{"v2.1.0", "planned",
-		"Performance: MULTIAPPEND batching and QRESYNC/CONDSTORE delta sync; " +
-			"OAuth 2.0 (XOAUTH2 / OAUTHBEARER); Prometheus-style metrics."},
+	{"v2.1.0", "done",
+		"OAuth 2.0 / modern authentication (SASL XOAUTH2 / OAUTHBEARER) with " +
+			"first-class Microsoft 365 and Google Workspace / Gmail providers, a " +
+			"mailferry auth command family (browser + headless authorisation, OS " +
+			"keychain storage), and bulk MSP models (Microsoft app-only, Google " +
+			"domain-wide delegation); MULTIAPPEND (RFC 3502) batched appends with " +
+			"automatic capability-negotiated batch sizing; accurate run-mode " +
+			"presentation; interactive persistent F9 Settings; expanded " +
+			"configuration; Results completion date/time; redesigned F6 Errors " +
+			"view. Released 2026-08-03."},
+	{"v2.1.x", "planned",
+		"QRESYNC/CONDSTORE delta sync, permanent quarantine purge, " +
+			"Prometheus-style metrics, macOS Developer ID signing + notarisation."},
 }
 
 // RoadmapLines renders plain, terminal-friendly roadmap lines.
 func RoadmapLines() []string {
-	mark := map[string]string{"done": "✓", "next": "▶", "planned": "·"}
-	label := map[string]string{"done": "released", "next": "in progress", "planned": "planned"}
+	mark := map[string]string{"done": "✓", "next": "▶", "planned": "·", "in development": "▶"}
+	label := map[string]string{"done": "released", "next": "in progress", "planned": "planned",
+		"in development": "in development"}
 	var out []string
 	for _, r := range Roadmap {
 		lb := label[r.Status]

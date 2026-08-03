@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ajsap/mailferry/v2/internal/paths"
 )
 
 // sandbox points every path-resolution input at empty temp directories
@@ -94,20 +96,23 @@ func TestInformationalCommandsHaveZeroSideEffects(t *testing.T) {
 }
 
 func TestConfigCommandCreatesExplicitly(t *testing.T) {
-	home, cwd := sandbox(t)
+	_, cwd := sandbox(t)
 	if rc := run([]string{"config"}); rc != 0 {
 		t.Fatalf("config rc=%d", rc)
 	}
-	cfg := filepath.Join(home, ".config", "mailferry", "mailferry.toml")
+	// Expected locations come from the same per-OS resolver the command
+	// uses, so this test holds on macOS/Windows too — not just XDG Linux.
+	native := paths.Default()
+	cfg := native.ConfigFile
 	data, err := os.ReadFile(cfg)
 	if err != nil {
 		t.Fatalf("explicit `mailferry config` must create the configuration: %v", err)
 	}
 	// nothing else appears — no DB, no logs, no cache
 	for _, unwanted := range []string{
-		filepath.Join(home, ".local", "state", "mailferry", "mailferry.db"),
-		filepath.Join(home, ".local", "state", "mailferry", "logs"),
-		filepath.Join(home, ".cache", "mailferry"),
+		native.StateDB,
+		native.LogsDir,
+		native.CacheDir,
 	} {
 		if _, err := os.Stat(unwanted); err == nil {
 			t.Fatalf("`mailferry config` must not create %s", unwanted)
@@ -131,8 +136,8 @@ func TestConfigCommandCreatesExplicitly(t *testing.T) {
 }
 
 func TestReadOnlyDBCommandsNeverCreateADatabase(t *testing.T) {
-	home, _ := sandbox(t)
-	native := filepath.Join(home, ".local", "state", "mailferry", "mailferry.db")
+	sandbox(t)
+	native := paths.Default().StateDB
 	for _, argv := range [][]string{{"status"}, {"failed"}, {"compact"},
 		{"retry-failed"}} {
 		if rc := run(append([]string(nil), argv...)); rc != 1 {
@@ -145,14 +150,14 @@ func TestReadOnlyDBCommandsNeverCreateADatabase(t *testing.T) {
 }
 
 func TestLegacyDevelopmentDBIsDetectedNotAdopted(t *testing.T) {
-	home, cwd := sandbox(t)
+	_, cwd := sandbox(t)
 	// a pre-rc.2 development database sits in the working directory
 	os.WriteFile(filepath.Join(cwd, "migration.db"), []byte("x"), 0o600)
 	db, hint := resolveStateDB("")
 	if hint == "" {
 		t.Fatal("legacy ./migration.db must produce an explicit hint")
 	}
-	if db != filepath.Join(home, ".local", "state", "mailferry", "mailferry.db") {
+	if db != paths.Default().StateDB {
 		t.Fatalf("resolved db drifted: %s", db)
 	}
 	// explicit --db always wins, no hint

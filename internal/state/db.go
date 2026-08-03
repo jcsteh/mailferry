@@ -32,7 +32,8 @@ PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=10000;
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS runs(
-  id TEXT PRIMARY KEY, started REAL, finished REAL, argv TEXT, result TEXT);
+  id TEXT PRIMARY KEY, started REAL, finished REAL, argv TEXT, result TEXT,
+  mode TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS mailboxes(
   id INTEGER PRIMARY KEY, key TEXT UNIQUE,
   src_host TEXT, src_user TEXT, dst_host TEXT, dst_user TEXT,
@@ -122,21 +123,55 @@ type DB struct {
 	LeaseFresh float64
 }
 
+// isLocked reports a transient SQLite lock contention (SQLITE_BUSY /
+// SQLITE_LOCKED), as opposed to a real schema or filesystem problem.
+func isLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "database is locked") || strings.Contains(s, "database table is locked")
+}
+
 func Open(path string, ephemeral bool, leaseFresh float64) (*DB, error) {
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)"
 	if ephemeral {
 		dsn = ":memory:"
 	}
-	con, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	con.SetMaxOpenConns(1) // single connection: serialised, WAL-safe
-	if _, err := con.Exec(schema); err != nil {
+	// Schema init is retried briefly on a lock contention.
+	//
+	// A brand-new database file starts in rollback-journal mode, and
+	// switching it to WAL needs a moment with no other connection attached.
+	// `PRAGMA journal_mode` is NOT covered by busy_timeout — SQLite will not
+	// wait for it — so a read-only observer that happens to open the file at
+	// that instant (a `mailferry attach` polling for a run that is just
+	// starting is exactly this) could fail the migration before it began.
+	// The window is milliseconds and the observer never holds the lock, so a
+	// short retry closes the race completely.
+	var con *sql.DB
+	deadline := time.Now().Add(5 * time.Second)
+	for attempt := 0; ; attempt++ {
+		var err error
+		con, err = sql.Open("sqlite", dsn)
+		if err != nil {
+			return nil, err
+		}
+		con.SetMaxOpenConns(1) // single connection: serialised, WAL-safe
+		if _, err = con.Exec(schema); err == nil {
+			break
+		}
 		con.Close()
-		return nil, fmt.Errorf("state database init: %w", err)
+		if !isLocked(err) || time.Now().After(deadline) {
+			return nil, fmt.Errorf("state database init: %w", err)
+		}
+		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 	}
 	con.Exec("INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version','1')")
+	// Additive migration for State Databases created before the run-mode
+	// column existed (v2.0.x): add it if missing. A duplicate-column error on
+	// an already-migrated DB is expected and ignored — no data is touched, so
+	// older databases still resume cleanly.
+	con.Exec("ALTER TABLE runs ADD COLUMN mode TEXT DEFAULT ''")
 	if leaseFresh < 30 {
 		leaseFresh = 300
 	}
@@ -149,10 +184,11 @@ func now() float64 { return float64(time.Now().UnixNano()) / 1e9 }
 
 // ---------------------------------------------------------------- runs --
 
-func (d *DB) StartRun(runID, argv string) {
+func (d *DB) StartRun(runID, argv, mode string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.con.Exec("INSERT OR REPLACE INTO runs(id,started,argv) VALUES(?,?,?)", runID, now(), argv)
+	d.con.Exec("INSERT OR REPLACE INTO runs(id,started,argv,mode) VALUES(?,?,?,?)",
+		runID, now(), argv, mode)
 }
 
 func (d *DB) EndRun(runID, result string) {
@@ -750,6 +786,7 @@ type StatusReport struct {
 	LastRunStart  float64
 	LastRunEnd    float64
 	LastResult    string
+	RunMode       string // authoritative run-mode display label of the last run
 	Counts        map[string]int64
 	MsgsDone      int64
 	MsgsTotal     int64
@@ -776,9 +813,9 @@ type MailboxRow struct {
 func (d *DB) Status(offlineAfter float64) StatusReport {
 	d.mu.Lock()
 	rep := StatusReport{Counts: map[string]int64{}}
-	d.con.QueryRow("SELECT id, started, COALESCE(finished,0), COALESCE(result,'') "+
-		"FROM runs ORDER BY started DESC LIMIT 1").
-		Scan(&rep.LastRunID, &rep.LastRunStart, &rep.LastRunEnd, &rep.LastResult)
+	d.con.QueryRow("SELECT id, started, COALESCE(finished,0), COALESCE(result,''), "+
+		"COALESCE(mode,'') FROM runs ORDER BY started DESC LIMIT 1").
+		Scan(&rep.LastRunID, &rep.LastRunStart, &rep.LastRunEnd, &rep.LastResult, &rep.RunMode)
 	rows, err := d.con.Query("SELECT status, COUNT(*) FROM mailboxes GROUP BY status")
 	if err == nil {
 		for rows.Next() {

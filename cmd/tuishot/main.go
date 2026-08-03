@@ -14,9 +14,15 @@
 // Fixture data uses RFC-2606 example domains only.
 package main
 
+// Usage: tuishot [view] [cols] [rows]
+//
+// The size arguments exist so a layout can be eyeballed at the widths
+// operators actually use — a cramped SSH window as well as a wide desktop —
+// without rebuilding anything.
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/ajsap/mailferry/v2/internal/tui"
 )
@@ -26,5 +32,16 @@ func main() {
 	if len(os.Args) > 1 {
 		view = os.Args[1]
 	}
-	fmt.Print(tui.RenderShot(view))
+	cols, rows := tui.ShotCols, tui.ShotRows
+	if len(os.Args) > 2 {
+		if n, err := strconv.Atoi(os.Args[2]); err == nil && n > 0 {
+			cols = n
+		}
+	}
+	if len(os.Args) > 3 {
+		if n, err := strconv.Atoi(os.Args[3]); err == nil && n > 0 {
+			rows = n
+		}
+	}
+	fmt.Print(tui.RenderShotSize(view, cols, rows))
 }

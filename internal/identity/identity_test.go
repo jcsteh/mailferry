@@ -28,7 +28,10 @@ func TestCanonicalIdentity(t *testing.T) {
 	if Product != "MailFerry" {
 		t.Fatalf("product drifted: %q", Product)
 	}
-	want := "MailFerry v" + Version + " — IMAP Migration & Sync"
+	// The banner carries the HUMAN rendering ("v2.1.0 RC1"), not the SemVer
+	// one ("2.1.0-RC1") — a hyphenated pre-release suffix reads as a defect
+	// to an operator. Version keeps the SemVer form for tags and filenames.
+	want := "MailFerry " + Display + " — IMAP Migration & Sync"
 	if BannerLine() != want {
 		t.Fatalf("banner drifted: %q (want %q)", BannerLine(), want)
 	}
@@ -40,7 +43,7 @@ func TestCanonicalIdentity(t *testing.T) {
 		t.Fatal("repository/support URLs drifted")
 	}
 	about := AboutText()
-	for _, want := range []string{Slogan, "v" + Version, "GNU AGPL v3.0",
+	for _, want := range []string{Slogan, Display, "GNU AGPL v3.0",
 		"Andy Saputra <andy@saputra.org>"} {
 		if !strings.Contains(about, want) {
 			t.Fatalf("about text missing %q", want)

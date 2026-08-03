@@ -297,11 +297,15 @@ func (r *Renderer) render(snap engine.Snapshot, rows int) []string {
 		fmt.Sprintf("%-14s: %s", "Runtime", util.FmtDHMS(time.Since(snap.BatchStart).Seconds())),
 	}
 	right := []string{
-		fmt.Sprintf("%-12s: %s / %s", "Wire RX/TX",
-			util.FmtBytes(float64(agg.WireRX)), util.FmtBytes(float64(agg.WireTX))),
+		// Cumulative traffic for the whole migration, matching the TUI
+		// Dashboard's wording so the two output modes agree.
+		fmt.Sprintf("%-12s: %s / %s", "Sent/Rcvd",
+			util.FmtBytes(float64(agg.WireTX)), util.FmtBytes(float64(agg.WireRX))),
 	}
 	br, mr := r.displayRates()
-	right = append(right, fmt.Sprintf("%-12s: %s/s (%.1f msg/s)", "Rate",
+	// Two equally useful measurements, so neither is parenthesised into
+	// looking like an aside.
+	right = append(right, fmt.Sprintf("%-12s: %s/s · %.1f msg/s", "Rate",
 		util.FmtBytes(br), mr))
 	if e, ok := r.eta(agg); ok {
 		right = append(right, fmt.Sprintf("%-12s: %s", "Batch ETA", util.FmtDHMS(e)))
@@ -420,6 +424,8 @@ func (r *Renderer) render(snap engine.Snapshot, rows int) []string {
 					"Destination", util.Truncate(d.Host, 24), strings.Join(d.Caps, ","),
 					d.ConnState, util.FmtBytes(float64(d.TXBytes)), d.Existing,
 					m.Appended, m.Adopted), W-6), "dim"))
+				out = append(out, "      "+C(util.Truncate(fmt.Sprintf(
+					"%-12s%s", "MULTIAPPEND", m.MA.Detail()), W-6), "dim"))
 			}
 		} else if doneAll && m.Error != "" && level >= 1 {
 			col := "red"
@@ -441,7 +447,7 @@ func (r *Renderer) render(snap engine.Snapshot, rows int) []string {
 		frag += "   " + C(fmt.Sprintf("%d with warnings", agg.Counts["WARNINGS"]), "yellow")
 	}
 	out = append(out, frag)
-	out = append(out, fmt.Sprintf("Msgs %d/%d (%s)   Data %s/%s (%s)   Rate %s/s (%.1f msg/s)   New %d   Adopted %d   Reconn %d",
+	out = append(out, fmt.Sprintf("Msgs %d/%d (%s)   Progress %s/%s (%s)   Rate %s/s (%.1f msg/s)   New %d   Adopted %d   Reconn %d",
 		agg.MsgsDone, agg.MsgsTotal, util.Pct(agg.MsgsDone, agg.MsgsTotal),
 		util.FmtBytes(float64(agg.BytesDone)), util.FmtBytes(float64(agg.BytesTotal)),
 		util.Pct(agg.BytesDone, agg.BytesTotal), util.FmtBytes(br), mr,

@@ -56,6 +56,19 @@ func cmdDedup(rest []string) int {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
 		return 1
 	}
+	// OAuth profiles for any "oauth:<name>" destination references.
+	dedupProfiles, dpWarns, dpErr := config.LoadOAuthProfiles(bootPath)
+	if dpErr != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", dpErr)
+		return 1
+	}
+	for _, w := range dpWarns {
+		fmt.Fprintln(os.Stderr, progress.C("note: "+w, "yellow"))
+	}
+	if err := config.ValidateOAuth(specs, dedupProfiles); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		return 2
+	}
 
 	fmt.Println(identity.BannerLine())
 	fmt.Println(identity.Slogan)
@@ -172,6 +185,15 @@ func cmdDedup(rest []string) int {
 			}
 		}
 		opt := engine.DedupOptions{Execute: *execute, TLSVerify: !*tlsNoVerify, Timeout: *timeout}
+		if spec.DstAuth != "" {
+			auth, aerr := engine.SASLAuthFor(&config.Run{OAuthProfiles: dedupProfiles},
+				spec.DstAuth, spec.Dst.User)
+			if aerr != nil {
+				fmt.Printf("  %-38s ERROR: %v\n", spec.Dst.Label(), aerr)
+				continue
+			}
+			opt.Auth = auth
+		}
 		rep, derr := engine.Dedup(ctx, spec, opt, db, mid, func(string) {})
 		if derr != nil {
 			if ctx.Err() != nil {

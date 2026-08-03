@@ -48,6 +48,33 @@ type MailboxRunner struct {
 	poison        map[string]*poisonRec
 	leaseLost     atomic.Bool
 	priorSet      bool // PriorDone baseline captured once per runner
+
+	// SASL bearer-token authenticators, built once per runner from any
+	// referenced OAuth profile and reused across reconnects so a long
+	// migration refreshes tokens rather than re-minting per connection.
+	// nil = password LOGIN for that endpoint. authBuilt guards one-time
+	// construction; authErr surfaces a profile/token-source failure.
+	srcAuth, dstAuth *imapx.SASLAuth
+	authBuilt        bool
+
+	// MULTIAPPEND state, held at MAILBOX level so it survives the folder
+	// syncer being rebuilt on every reconnect. maDemoted is sticky for the
+	// rest of the mailbox: a destination that advertises MULTIAPPEND and
+	// then mishandles it is not asked again.
+	maPolicy   config.MultiAppendPolicy
+	maResolved bool
+	maRejects  atomic.Int32
+	maDemoted  atomic.Bool
+}
+
+// multiAppendPolicy resolves the run's batching policy once per mailbox.
+// It is pure configuration — capability detection happens per connection.
+func (r *MailboxRunner) multiAppendPolicy() config.MultiAppendPolicy {
+	if !r.maResolved {
+		r.maPolicy = r.Cfg.MultiAppendPolicyFor()
+		r.maResolved = true
+	}
+	return r.maPolicy
 }
 
 var errStaleFailed = fmt.Errorf("stale recovery exhausted")
@@ -463,6 +490,11 @@ func (r *MailboxRunner) attempt() (string, error) {
 }
 
 func (r *MailboxRunner) openPair() error {
+	// Build the SASL authenticators once (nil for password endpoints). A
+	// bad OAuth profile / unreachable secret fails here, before any socket.
+	if err := r.buildAuth(); err != nil {
+		return err
+	}
 	to := time.Duration(r.Cfg.Timeout * float64(time.Second))
 	r.cliMu.Lock()
 	r.src = imapx.NewClient(imapx.Endpoint(r.Spec.Src), to, r.Cfg.TLSVerify,
@@ -474,6 +506,8 @@ func (r *MailboxRunner) openPair() error {
 		c.Baseline = r.Cfg.Baseline
 		c.ReadOnly = r.Cfg.DryRun // --dry-run: the client blocks every mutation
 	}
+	r.src.Auth = r.srcAuth // nil = password LOGIN (unchanged default)
+	r.dst.Auth = r.dstAuth
 	r.cliMu.Unlock()
 	type res struct{ err error }
 	ch := make(chan res, 2)
@@ -507,7 +541,7 @@ func (r *MailboxRunner) openPair() error {
 }
 
 func (r *MailboxRunner) badges() {
-	badge := func(c *imapx.Client, sec string) []string {
+	badge := func(c *imapx.Client, sec string, dst bool) []string {
 		b := []string{map[string]string{"ssl": "SSL", "tls": "STARTTLS", "none": "PLAIN"}[sec]}
 		if c.Has("UIDPLUS") {
 			b = append(b, "UID+")
@@ -515,14 +549,70 @@ func (r *MailboxRunner) badges() {
 		if c.Has("LITERAL+") && !c.Baseline {
 			b = append(b, "LIT+")
 		}
+		// MULTIAPPEND is a DESTINATION capability — badging the source with
+		// it would tell the operator something true but useless.
+		if dst && c.SupportsMultiAppend() && r.multiAppendPolicy().Enabled {
+			b = append(b, "MA")
+		}
 		if c.Compressed() {
 			b = append(b, "ZIP")
 		}
 		return b
 	}
-	sb := badge(r.src, r.Spec.Src.Security)
-	db := badge(r.dst, r.Spec.Dst.Security)
-	r.MB.Set(func(m *MBValues) { m.Src.Caps = sb; m.Dst.Caps = db })
+	sb := badge(r.src, r.Spec.Src.Security, false)
+	db := badge(r.dst, r.Spec.Dst.Security, true)
+	srcCaps, dstCaps := r.src.CapabilityList(), r.dst.CapabilityList()
+	policy := r.multiAppendPolicy()
+	supported := r.dst.SupportsMultiAppend()
+
+	// Server identification, from evidence the servers volunteered during
+	// this connection only. Disagreements and the full evidence trail go to
+	// the per-mailbox log at debug level, never to the Dashboard.
+	// The OAuth provider is the strongest identification evidence there is —
+	// this connection is authenticated, so a token that provider minted was
+	// accepted by this server. It is passed only when the endpoint really
+	// authenticated that way; a password endpoint contributes nothing here.
+	srcID := r.src.Identify(oauthProviderOf(r.Cfg, r.Spec.SrcAuth))
+	dstID := r.dst.Identify(oauthProviderOf(r.Cfg, r.Spec.DstAuth))
+	for label, id := range map[string]imapx.ServerIdent{"src": srcID, "dst": dstID} {
+		if r.Cfg.Debug || r.Cfg.Trace {
+			r.Logf("%s: %s", label, id.EvidenceLog())
+		}
+		if c := id.ConflictLog(); c != "" {
+			r.Logf("%s: %s", label, c)
+		}
+	}
+	srcAuth := authLabel(r.Cfg, r.Spec.SrcAuth)
+	dstAuth := authLabel(r.Cfg, r.Spec.DstAuth)
+
+	r.MB.Set(func(m *MBValues) {
+		m.Src.Caps, m.Dst.Caps = sb, db
+		m.Src.Advertised, m.Dst.Advertised = srcCaps, dstCaps
+		m.Src.Server, m.Src.ServerVersion = srcID.Name, srcID.Version
+		m.Dst.Server, m.Dst.ServerVersion = dstID.Name, dstID.Version
+		m.Src.Security, m.Dst.Security = srcID.Security, dstID.Security
+		m.Src.Auth, m.Dst.Auth = srcAuth, dstAuth
+		m.MA.Enabled = policy.Enabled
+		m.MA.BatchLabel = policy.BatchLabel()
+		m.MA.Probed = true
+		m.MA.Supported = supported
+		m.MA.Demoted = r.maDemoted.Load()
+	})
+}
+
+// noteBatch records one completed MULTIAPPEND for the run-information
+// surfaces. Telemetry only — it never touches message accounting.
+func (r *MailboxRunner) noteBatch(messages int) {
+	r.MB.Set(func(m *MBValues) {
+		m.MA.Commands++
+		m.MA.Messages += int64(messages)
+		m.MA.LastBatch = messages
+	})
+}
+
+// noteMADemoted records that batching was abandoned for this mailbox.
+func (r *MailboxRunner) noteMADemoted() {
+	r.MB.Set(func(m *MBValues) { m.MA.Demoted = true })
 }
 
 func (r *MailboxRunner) closePair(graceful bool) {

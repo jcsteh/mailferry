@@ -313,6 +313,55 @@ func TestTerminalRunTUIPoisonedPTYAndRepeat(t *testing.T) {
 	}
 }
 
+// TestTerminalDryRunExitContract proves a --dry-run interactive run follows
+// the SAME intentional post-exit contract as a normal run: it lands on the
+// Results screen (DRY RUN COMPLETE), and after Q the shell gets only the
+// concise confirmation — never a second full report — with the dry-run
+// framing preserved. This is the normal-vs-dry-run parity the exit contract
+// requires.
+func TestTerminalDryRunExitContract(t *testing.T) {
+	bin := buildBinary(t)
+	dir, home := t.TempDir(), t.TempDir()
+	src := fakeimap.NewServer(acct("fritz", 6))
+	dst := fakeimap.NewServer(fakeimap.NewAccount("fritz2", "pw"))
+	if err := src.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer src.Stop()
+	defer dst.Stop()
+	csv := csvFor(t, dir, "d.csv", src.Port(), dst.Port(), [][2]string{{"fritz", "fritz2"}})
+
+	out, healed := runOnPTYQ(t, home, true, true, bin,
+		"run", csv, "--dry-run", "--stale-timeout", "0", "--retry-delay", "1")
+	if !bytes.Contains(out, []byte("\x1b[?1049h")) {
+		t.Fatalf("dry-run TUI never started:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("DRY RUN COMPLETE")) {
+		t.Fatalf("dry run must land on the DRY RUN COMPLETE Results screen:\n%s", out)
+	}
+	post := out[bytes.LastIndex(out, []byte("\x1b[?1049l")):]
+	if !bytes.Contains(post, []byte("complete:")) || !bytes.Contains(post, []byte("Results: ")) {
+		t.Fatalf("dry-run exit must print the same concise confirmation:\n%s", post)
+	}
+	if !bytes.Contains(post, []byte("dry run, nothing was written")) {
+		t.Fatalf("dry-run confirmation must preserve the dry-run framing:\n%s", post)
+	}
+	if bytes.Contains(post, []byte("Total runtime")) {
+		t.Fatalf("dry run dumped the full report after Results (must not):\n%s", post)
+	}
+	assertLeftMargin(t, "run-tui/dry-run", out)
+	if !healed {
+		t.Fatal("dry-run left the tty without ONLCR")
+	}
+	// A dry run writes nothing to the destination.
+	if got := len(dst.Accounts["fritz2"].Folder("INBOX").Msgs); got != 0 {
+		t.Fatalf("dry run wrote %d messages to the destination (want 0)", got)
+	}
+}
+
 func TestTerminalHeadlessPoisonedPTY(t *testing.T) {
 	bin := buildBinary(t)
 	dir, home := t.TempDir(), t.TempDir()

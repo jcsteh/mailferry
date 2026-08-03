@@ -66,9 +66,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.shutHold = true // hold the completed dialog briefly
 			return m, tea.Tick(700*time.Millisecond, func(time.Time) tea.Msg { return phaseMsg{} })
 		}
-		m.quitting = true
+		// Graceful stop complete: land on the Results screen exactly like a
+		// natural completion — the interrupted run gets the same final
+		// report surface, and the exit contract stays identical (operator
+		// reviews, quits, concise shell acknowledgement — never a dump).
+		m.shuttingDown = false
+		m.finished = true
+		m.resultsShown = true
 		m.stopSysmon()
-		return m, tea.Quit
+		m.snap = m.stats.Snapshot()
+		m.active = vResults
+		return m, nil
 
 	case tea.MouseMsg:
 		if m.popup == nil && m.active == vLogs {
@@ -94,37 +102,48 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Ctrl+C: graceful shutdown dialog; a second Ctrl+C forces exit.
+	// Ctrl+C escalates through the SAME gate as every other quit path:
+	// confirm → graceful stop → force. Each press moves one step, so the
+	// familiar "hammer Ctrl+C to get out" still works while a single
+	// accidental press can no longer end a migration.
 	if key == "ctrl+c" {
-		if m.finished {
-			// engine already done — nothing to stop; exit cleanly
-			m.quitting = true
-			m.stopSysmon()
-			return m, tea.Quit
-		}
-		if m.shuttingDown {
+		switch {
+		case m.shuttingDown:
 			m.forced = true
 			if m.hardKC != nil {
 				m.hardKC()
 			}
 			m.quitting = true
 			return m, tea.Quit
+		case m.confirmQuit:
+			return m.doQuit()
+		default:
+			m.requestQuit()
+			return m, nil
 		}
-		m.shuttingDown = true
-		m.shutdownAt = timeNow()
-		m.shutPhase = 0
-		if m.cancel != nil {
-			m.cancel()
-		}
-		return m, nil
 	}
 	if m.shuttingDown {
 		return m, nil // dialog owns the screen; ignore other keys
 	}
 
-	// An open detail popup captures input: Esc / Enter / q close it.
+	// The quit confirmation owns the screen while it is open. Esc and n
+	// dismiss it — Esc must never be able to end MailFerry.
+	if m.confirmQuit {
+		switch key {
+		case "y", "Y", "enter":
+			return m.doQuit()
+		case "n", "N", "esc":
+			m.confirmQuit = false
+		}
+		return m, nil
+	}
+
+	// An open detail popup captures input: Esc / Enter return to the list.
+	// "q" deliberately does NOT close it — q is the quit key everywhere
+	// else, and having it mean two different things is how operators end up
+	// quitting when they meant to go back.
 	if m.popup != nil {
-		if key == "esc" || key == "enter" || key == "q" {
+		if key == "esc" || key == "enter" {
 			m.popup = nil
 		}
 		return m, nil
@@ -151,19 +170,29 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// F9 Settings text-edit mode captures ALL typing (a value may contain
+	// digits or letters that would otherwise trigger navigation) — Enter
+	// commits, Esc cancels. Ctrl+C already returned above, so shutdown
+	// still works mid-edit.
+	if m.active == vSettings && m.set.editing {
+		m.settingsKey(key, msg.Runes)
+		return m, nil
+	}
+
 	// Results screen keys (completion home)
 	if m.active == vResults {
 		switch key {
-		case "enter":
+		case "enter", "esc":
+			// Esc goes BACK, never out. Quitting is always q / Ctrl+C, and
+			// always through the confirmation.
 			m.active = vMailboxes
 			return m, nil
 		case "s", "S":
 			m.openReportsPopup()
 			return m, nil
-		case "esc", "q":
-			m.quitting = true
-			m.stopSysmon()
-			return m, tea.Quit
+		case "q":
+			m.requestQuit()
+			return m, nil
 		}
 	}
 
@@ -181,6 +210,17 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// F9 Settings browse mode: the editor claims navigation/edit/save keys
+	// (↑↓ ⏎ Space +/- S) and Esc/q when there are unsaved changes to
+	// discard. It deliberately does NOT claim Esc/q otherwise, so normal
+	// back-navigation still works. Runs before the global keys so Space
+	// toggles a setting instead of freezing the display.
+	if m.active == vSettings {
+		if m.settingsKey(key, msg.Runes) {
+			return m, nil
+		}
+	}
+
 	// global keys (parity with the classic TUI)
 	switch key {
 	case "tab":
@@ -189,7 +229,14 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.active = (m.active + numViews - 1) % numViews
 		return m, nil
-	case "esc", "q":
+	case "q":
+		// q always means quit, and quitting always confirms.
+		m.requestQuit()
+		return m, nil
+	case "esc":
+		// Esc is "back", never "out". It clears a search, returns from a
+		// sub-view to the home screen, and does nothing at all on the home
+		// screen itself.
 		if m.search != "" {
 			m.search = ""
 			m.searchView = -1
@@ -255,13 +302,17 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mailSel = clampNav(key, m.mailSel, len(rows))
 		}
 	case vErrors:
-		rows := m.errorRows()
+		items := m.errorItems()
 		if key == "enter" {
-			if len(rows) > 0 && m.errSel < len(rows) {
-				m.openErrorPopup(rows[m.errSel])
+			if len(items) > 0 && m.errSel < len(items) {
+				if it := items[m.errSel]; it.isReg {
+					m.openFailedPopup(it.reg)
+				} else {
+					m.openErrorPopup(it.err)
+				}
 			}
 		} else {
-			m.errSel = clampNav(key, m.errSel, len(rows))
+			m.errSel = clampNav(key, m.errSel, len(items))
 		}
 	case vHistory:
 		hist := m.historyRows()

@@ -29,6 +29,10 @@ import (
 func TestConfigFirstRunGeneratesTOML(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MAILFERRY_CONFIG_DIR", dir)
+	// The pre-rc.2 legacy probe (~/.config/mailferry on macOS) resolves
+	// under $HOME; sandbox it so a real legacy config on the developer's
+	// machine cannot win over the empty override directory.
+	t.Setenv("HOME", t.TempDir())
 	cfg := config.Defaults()
 	warns, path, created := config.LoadTOML(cfg, "", true)
 	if !created {

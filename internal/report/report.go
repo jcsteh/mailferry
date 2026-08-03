@@ -207,7 +207,7 @@ func summaryHints(snap engine.Snapshot, c func(string, string) string) []string 
 }
 
 func PrintSummary(snap engine.Snapshot, resultsPath string, cfg *config.Run,
-	runtime float64, interrupted bool, colf func(string, string) string) {
+	runtime float64, finished time.Time, interrupted bool, colf func(string, string) string) {
 	agg := snap.Agg()
 	c := colf
 	fmt.Println()
@@ -217,10 +217,28 @@ func PrintSummary(snap engine.Snapshot, resultsPath string, cfg *config.Run,
 	}
 	fmt.Println(c(title, "bold"))
 	kv := func(k, v string) { fmt.Printf("%-21s: %s\n", k, v) }
+	if !finished.IsZero() {
+		// The engine's terminal-state instant — the same value the Results
+		// TUI shows, never re-stamped at render time.
+		label := "Completed"
+		if interrupted {
+			label = "Interrupted"
+		} else if agg.Counts["FAILED"] > 0 || agg.Counts["STALE"] > 0 {
+			label = "Finished"
+		}
+		kv(label, util.FmtStamp(finished))
+	}
 	kv("Total runtime", util.FmtDHMS(runtime))
 	kv("Run", cfg.RunID)
+	// Authoritative mode line — the same run-mode string the TUI, banner and
+	// persisted run record use, so headless and interactive tell one truth.
+	modeColor := "cyan"
 	if cfg.DryRun {
-		kv("Mode", c("DRY RUN — nothing was written to either server or the State Database", "yellow"))
+		modeColor = "yellow"
+	}
+	kv("Mode", c(snap.Mode, modeColor))
+	if cfg.DryRun {
+		kv("Dry run", c("nothing was written to either server or the State Database", "yellow"))
 	}
 	if cfg.Range.Active {
 		kv("Date range", cfg.Range.Label())

@@ -42,8 +42,13 @@ type ResultMsg struct {
 	ResultsCSV string
 	FailedCSV  string
 	SessionLog string
-	Runtime    float64 // seconds, authoritative wall clock from the runner
+	Runtime    float64  // seconds, authoritative wall clock from the runner
+	Modes      []string // authoritative active run modifiers (config.RunMode)
 }
+
+// interrupted reports whether this run ended on a graceful stop rather
+// than by completing its plan (authoritative: the engine's RunResult).
+func (r *ResultMsg) interrupted() bool { return r != nil && r.Res.Interrupted }
 
 // comma renders 63074 as 63,074 (presentation only).
 func comma(n int64) string {
@@ -69,6 +74,10 @@ func (m *Model) verdict() (text string, style lipgloss.Style) {
 	switch {
 	case agg.Counts["FAILED"] > 0 || agg.Counts["STALE"] > 0:
 		return "✘  MIGRATION FAILED — SOME MAILBOXES NEED ATTENTION", cRed.Bold(true)
+	case m.results.interrupted() && m.results.DryRun:
+		return "⚠  DRY RUN INTERRUPTED — NOTHING WAS WRITTEN", cYellow.Bold(true)
+	case m.results.interrupted():
+		return "⚠  MIGRATION INTERRUPTED — PARTIAL RESULTS", cYellow.Bold(true)
 	case m.results != nil && m.results.DryRun:
 		return "✔  DRY RUN COMPLETE — NOTHING WAS WRITTEN", cCyan.Bold(true)
 	case agg.Counts["WARNINGS"] > 0 || agg.Counts["PARTIAL"] > 0:
@@ -77,6 +86,20 @@ func (m *Model) verdict() (text string, style lipgloss.Style) {
 		return "✔  MIGRATION COMPLETE — NOTHING NEW TO COPY", cGreen.Bold(true)
 	default:
 		return "✔  MIGRATION COMPLETE", cGreen.Bold(true)
+	}
+}
+
+// stampLabel picks the contextually honest label for the terminal-state
+// timestamp: a run that was stopped was not "Completed".
+func (m *Model) stampLabel() string {
+	agg := m.snap.Agg()
+	switch {
+	case m.results.interrupted():
+		return "Interrupted"
+	case agg.Counts["FAILED"] > 0 || agg.Counts["STALE"] > 0:
+		return "Finished"
+	default:
+		return "Completed"
 	}
 }
 
@@ -155,23 +178,17 @@ func (m *Model) resultsView(w, h int) string {
 	r := m.results
 	var out []string
 
-	// ---- PRIMARY: verdict banner + context line ------------------------
+	// ---- PRIMARY: verdict banner + mode + context lines ----------------
 	text, vs := m.verdict()
 	out = append(out, "", center(vs.Render(text), w))
+	// The authoritative active-mode line (Migration & Sync · Dry Run · …),
+	// shown from the single run-mode source so Results tells the same truth
+	// as the banner, dashboard, headless summary and the persisted record.
+	if r != nil && len(r.Modes) > 0 {
+		out = append(out, center(cCyan.Render("Migration & Sync · "+strings.Join(r.Modes, " · ")), w))
+	}
 	ctx := []string{}
 	if r != nil {
-		if r.DryRun {
-			ctx = append(ctx, "dry run — zero mutations")
-		}
-		if r.RangeLabel != "" {
-			ctx = append(ctx, "date range "+r.RangeLabel)
-		}
-		if r.Portable {
-			ctx = append(ctx, "portable mode")
-		}
-		if r.Ephemeral {
-			ctx = append(ctx, "ephemeral — nothing persisted")
-		}
 		ctx = append(ctx, "run "+r.RunID)
 		if r.WorkerID != "" {
 			ctx = append(ctx, "worker "+r.WorkerID)
@@ -189,11 +206,17 @@ func (m *Model) resultsView(w, h int) string {
 	if r != nil && r.Runtime > 0 {
 		runtime = r.Runtime
 	}
-	runLines := []string{
+	runLines := []string{}
+	if r != nil && !r.Res.FinishedAt.IsZero() {
+		// The terminal-state instant, captured once by the engine — stable
+		// across redraws, reopens and the headless summary (same truth).
+		runLines = append(runLines, rkv(m.stampLabel(), util.FmtStamp(r.Res.FinishedAt)))
+	}
+	runLines = append(runLines,
 		rkv("Runtime", util.FmtDHMS(runtime)),
 		rkv("Mailboxes", fmt.Sprintf("%d attempted · %d in CSV", attempted, len(snap.Mailboxes))),
 		rkv("Successful", cGreen.Render(fmt.Sprint(agg.Counts["SUCCESS"]))),
-	}
+	)
 	if n := agg.Counts["WARNINGS"]; n > 0 {
 		runLines = append(runLines, rkv("With warnings", cYellow.Render(fmt.Sprint(n))))
 	}
@@ -406,7 +429,8 @@ func (m *Model) attentionLines(w int) []string {
 				statusDisplay(mb.Status), util.Ellipsize(orEmpty(mb.Error), 90)), w-2)))
 		}
 	}
-	if agg.Counts["FAILED"]+agg.Counts["STALE"]+agg.Counts["PARTIAL"] > 0 {
+	if agg.Counts["FAILED"]+agg.Counts["STALE"]+agg.Counts["PARTIAL"] > 0 ||
+		m.results.interrupted() {
 		lines = append(lines, " "+cCyan.Render(
 			"Resume: re-run the same command — completed messages are never re-copied."))
 	}

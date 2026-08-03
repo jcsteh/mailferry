@@ -124,7 +124,15 @@ func RenderAttach(s AttachSnapshot) string {
 	}
 	title += " · db " + s.DBPath
 	b.WriteString(cDim.Render(title))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	// The run's mode comes from the PERSISTED run record, not from this
+	// attaching process — attach reflects the real characteristics of the
+	// run it is watching (dry run, date range, portable, …).
+	if s.Report.RunMode != "" {
+		b.WriteString(cCyan.Render(" " + s.Report.RunMode))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 
 	rep := s.Report
 	kv := func(k, v string) { b.WriteString(fmt.Sprintf("%-20s %s\n", k, v)) }

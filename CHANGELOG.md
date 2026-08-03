@@ -9,9 +9,344 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - macOS Developer ID signing + notarisation pipeline
-  (docs/RELEASING-MACOS.md) — v2.0.0 binaries are not yet signed or
-  notarised.
-- OAuth 2.0, MULTIAPPEND, QRESYNC, quarantine purge (v2.1.0).
+  (docs/RELEASING-MACOS.md) — binaries are not yet signed or notarised.
+- QRESYNC/CONDSTORE delta sync, permanent quarantine purge,
+  Prometheus-style metrics (v2.1.x and beyond).
+
+## [2.1.0] - 2026-08-03
+
+Feature release: OAuth 2.0 / modern authentication with a first-class
+`mailferry auth` lifecycle, IMAP MULTIAPPEND batching, evidence-based
+server identification, and a substantially polished operator experience.
+Migration correctness, the statistics identity, terminal sanitisation and
+SIGHUP handling are all unchanged and still test-enforced.
+
+### Added
+
+- **OAuth 2.0 / modern IMAP authentication** (SASL XOAUTH2, and OAUTHBEARER
+  for standards-compliant servers). First-class providers: **Microsoft 365
+  / Exchange Online** and **Google Workspace / Gmail**; a **generic**
+  provider covers other standards-compliant OAuth IMAP servers. The
+  authentication layer separates SASL *mechanisms* from OAuth *providers*,
+  and the migration engine consumes an authenticated connection without any
+  provider-specific logic. Source and destination authenticate independently
+  (password↔OAuth, or two different providers, in one run). Access tokens are
+  refreshed automatically from a refresh token across a long migration.
+  Configuration is backward-compatible: the canonical 10-column CSV is
+  unchanged — an endpoint uses OAuth by putting `oauth:<profile>` in its
+  password column, with `[oauth.<profile>]` profiles defined in
+  mailferry.toml. **Secrets are never stored**: client secrets and refresh
+  tokens are given as external references (`env:` / `file:` / `keychain:` /
+  `cmd:`) resolved at run time and never written to the State Database,
+  logs, reports or traces; the XOAUTH2/OAUTHBEARER SASL payload is redacted
+  from `--trace`; a literal secret in configuration is rejected. MailFerry
+  never silently falls back from OAuth to password LOGIN — failures are
+  actionable (mechanism not advertised, invalid_grant, consent/scope missing,
+  tenant policy, invalid client). See `docs/OAUTH.md`.
+- **`mailferry auth` command family** — a first-class authentication
+  lifecycle with the polish of a modern CLI sign-in tool. `auth add
+  <provider> --name` opens the browser itself (127.0.0.1 loopback + PKCE,
+  RFC 8252), **always** shows a copyable URL as well, reports
+  waiting/success/cancellation/failure plainly, and finishes by naming the
+  **account** that was authorised — read from the provider's OpenID Connect
+  `id_token` (interactive requests additionally ask for the identity-only
+  `openid`/`email` scopes, which grant no mailbox access; the claim is a
+  label and never an authorisation decision). An operator never copies an
+  access token by hand.
+  Headless (`--no-browser`): Microsoft uses the device-code flow (RFC 8628);
+  Google/generic use **manual redirect capture** — the same officially
+  supported loopback + PKCE flow, with the authorisation code carried back by
+  copy-and-paste from the failed `127.0.0.1` redirect, while the loopback
+  listener runs concurrently so a forwarded port simply completes by itself.
+  MailFerry never emulates a flow a provider does not offer.
+  `auth add --user MAILBOX` names the account to authorise: it is sent as the
+  standard OIDC `login_hint` so the provider pre-selects it, and the account
+  that actually signed in is **verified afterwards** — on a mismatch nothing
+  is saved. This closes a trap with real consequences: a delegated profile
+  authenticates whoever signs in, so an operator who signs in as a tenant
+  administrator to grant consent would otherwise walk away with a profile
+  bound to the administrator's mailbox. Without `--user`, Microsoft is asked
+  for the account picker instead, so a stale single-sign-on session cannot
+  silently choose; `auth refresh` uses the profile's recorded account as the
+  hint automatically, so re-authorising can never rebind a profile to a
+  different mailbox.
+  `auth list` / `show` / `test` / `refresh` / `remove` cover the rest of the
+  lifecycle; none ever display a token or secret, and `remove` clearly
+  distinguishes deleting the local profile from revoking the grant at the
+  provider. `auth test` now mints a token **and** performs a real, read-only
+  IMAP login against the provider's documented host (`--no-imap` to skip).
+- **Bulk / MSP authentication models** — beyond delegated (per-user) OAuth,
+  `kind = "application"` uses Microsoft 365 app-only client credentials
+  (`IMAP.AccessAsApp`) so one tenant app authenticates **many** mailboxes,
+  and `kind = "service_account"` uses a Google Workspace service account with
+  **domain-wide delegation** (signed-JWT impersonation) so one account
+  authenticates **many** mailboxes — the target mailbox is the SASL login in
+  both. Delegated, application and service-account models are kept distinct in
+  configuration, validation, the CLI and the docs. An administrative profile's
+  token source is **shared across the whole run**: a Microsoft 365
+  `application` profile mints its tenant-level token once for hundreds of
+  mailboxes and every worker, instead of once per mailbox.
+- **Coherent secure credential storage on every OS.** A storage backend is
+  now chosen only when MailFerry has verified it can also *read the value
+  back on that platform*: macOS login keychain and Linux Secret Service
+  (`keychain:` references), **Windows DPAPI** (`CryptProtectData`,
+  current-user scope, `dpapi:` references — real OS cryptography with an
+  OS-managed key, since Windows has no plaintext-returning credential CLI),
+  and a documented 0600-file last resort with guidance to use `env:` / `file:`
+  on encrypted storage / `cmd:` with an external secret manager instead.
+  `auth add` can prompt for an application client secret with **no echo** and
+  store it, and can import a service-account key file into the store, so
+  neither has to sit in a hand-managed location.
+- **IMAP MULTIAPPEND (RFC 3502)** — several messages uploaded in **one**
+  APPEND command when the destination advertises the capability. On by
+  default (`migration.multiappend = "auto"`, `--multiappend auto|off`), with
+  automatic batch sizing (`migration.multiappend_batch_size = "auto"`,
+  `--multiappend-batch-size auto|N`) and an F9 Settings entry. `Auto` sizes
+  each batch from the smallest of four documented limits: message count
+  (scaled by configured concurrency), an aggregate byte budget, the source
+  FETCH pipeline depth, and a solo threshold above which a large message is
+  never batched. Measured on the built-in benchmark, 400 × 8 KB messages went
+  from 400 APPEND commands to 50 — an 8× reduction in append commands for
+  that corpus; no universal speed-up is claimed, since the benefit depends on
+  latency, server and message sizes. **It is an optimisation and nothing
+  more**: bodies still stream chunk-by-chunk (memory stays O(chunk), never
+  O(batch)); a destination without the capability, `--baseline` and
+  `--dry-run` transparently use the unchanged single-append path; the append
+  window still bounds in-flight *messages*, so cancellation is as responsive
+  as before; progress and statistics remain per message with
+  `MsgsDone == Appended + Adopted + PriorDone + Planned` intact; and every
+  message keeps its own durable state row, destination UID (from the RFC 4315
+  APPENDUID uid-set), flags and INTERNALDATE. A batch is never a unit of
+  durable accounting. Because RFC 3502 makes MULTIAPPEND atomic, a rejected
+  batch stored nothing, so the messages are safely retried individually and
+  batching is disabled for the mailbox after a second rejection; a `BAD`
+  (the server could not parse a command it advertised) additionally drops the
+  connection so reconciliation runs before anything is appended again.
+  MULTIAPPEND deliberately does **not** appear in the primary Mode line —
+  it belongs in Settings, logs and telemetry. See `docs/MULTIAPPEND.md`.
+- **One authoritative version definition.** `internal/identity` now defines
+  the release as `Core` (the semantic version) plus `Stage` (`dev`,
+  `alpha1`, `beta2`, `RC1`, … or empty for a final release), and every
+  version string in MailFerry derives from those two constants — the
+  Dashboard banner, splash, `version`, Help/About, logs, diagnostics, the
+  RFC 2971 ID MailFerry sends, generated configuration comments, benchmark
+  output, release artefact names and the git tag. Promoting a release
+  candidate to the final release is a one-line change (`Stage = ""`).
+  `build.sh` now asks the binary via `mailferry version --bare` instead of
+  parsing source, so the build system consumes the same definition. Two
+  renderings exist for two audiences: `Version` is the SemVer form
+  (`2.1.0-RC1`) for tags, filenames and anything a machine compares, and
+  `Display` is the human form (`v2.1.0 RC1`) for banners. A test walks the
+  repository and fails if any Go source outside `internal/identity`
+  hard-codes the version, and another fails if `build.sh` stops deriving it.
+- **Version is now v2.1.0 RC1** throughout.
+- **Runtime freezes when the run ends, and the Dashboard says when.** The
+  Dashboard's Runtime used to keep counting after a migration finished,
+  reporting something that was no longer true. It now freezes at the real
+  duration, and a `Completed` / `Interrupted` / `Finished` row appears with
+  the completion date and time to the second and with the zone. That instant
+  is the engine's `RunResult.FinishedAt` — the same value the reports, the
+  results CSV and the Results screen already use, so there is exactly one
+  completion time anywhere in MailFerry. A finished mailbox's detail freezes
+  with the same discipline.
+- **Durations and timestamps read like a tool, not a debugger.**
+  `util.FmtDHMS` — still the single duration renderer — omits a zero day
+  component (`01:32:05` rather than `0 day 01:32:05`) and says `2 days` when
+  there are two. `util.FmtStamp` — still the single timestamp renderer — now
+  always includes seconds and the zone (`03/08/2026 21:14:37 NZST`), because
+  a completion time exists to be correlated with server logs and tickets.
+  Territory still governs date order; the time is 24-hour everywhere.
+- **Rebalanced Dashboard.** The left column no longer sits half empty: the
+  run information is laid out in two evenly split, colon-free aligned
+  columns, with the connection panel below it. The layout adapts —
+  side-by-side panel on a wide terminal, a condensed line per side on a
+  narrow one, and on a short terminal the panel yields its rows to the
+  mailbox list (the primary content; the same detail is one keypress away in
+  the F3 inspector). `tuishot` takes optional `cols`/`rows` arguments so a
+  layout can be checked at real terminal sizes, and the layout tests drive
+  the same renderer at six widths, asserting no line ever overflows.
+- **Live mailbox inspector.** The F3 mailbox detail (Enter) used to freeze a
+  snapshot taken at the moment it opened. It is now a live inspector: every
+  figure re-renders from the current snapshot on the same ticker as the
+  Dashboard — status, folders, messages, bytes, throughput, per-mailbox ETA,
+  adopted, failed, reconnects, elapsed, current operation, MULTIAPPEND state
+  and batch figures, both servers' identification, transport security and the
+  destination's notable capabilities. It follows the mailbox by name, so
+  re-sorting or filtering the list underneath it cannot silently swap which
+  mailbox is being inspected, and a mailbox that leaves the run says so
+  instead of showing somebody else's numbers. Esc or Enter returns to the
+  list.
+- **One way out.** Every interactive quit path — `q`, Ctrl+C, and the
+  Results screen — now funnels through a single confirmation dialog, and
+  **Esc can no longer end MailFerry from any screen**. Esc means "back":
+  it clears a search, closes a dialog, returns from a detail or edit screen,
+  and does nothing at all on the home screen. When a migration is still
+  running the dialog says plainly that stopping is safe — completed work is
+  already recorded in the State Database and re-running resumes from exactly
+  where the run stops, with nothing lost and nothing copied twice. Ctrl+C
+  still escalates for an operator in a hurry (confirm → graceful stop →
+  force), so the emergency path is unchanged in length. SIGHUP deliberately
+  does **not** route through the dialog: a terminal that has gone away cannot
+  answer one, and stopping gracefully on hangup remains the v2.0.3 behaviour.
+- **Source / Destination connection panel** on the Dashboard, filling space
+  the left column was wasting. It describes the two **live connections** —
+  `Host`, `Server`, `Auth`, `TLS` and `Speed` per side — and deliberately
+  does not repeat the run's cumulative traffic, which the `Sent/Rcvd` row
+  above already answers. `Speed` is that connection's current throughput,
+  one figure per side: every IMAP connection both sends and receives by
+  nature, so splitting it into TX/RX would add a column without adding an
+  answer.
+  Identification uses only evidence learned from the live connection, in
+  descending confidence: the **OAuth provider** whose token this server
+  accepted (nothing else can accept it), the server's RFC 2971 ID response,
+  vendor-private capabilities that name their own vendor, the greeting
+  banner, and the TLS certificate. **There is no hostname table and no
+  bundled provider database to maintain**; the identifier is not even given
+  the hostname, so guessing from a domain is structurally impossible rather
+  than merely discouraged. A server MailFerry has never heard of still
+  identifies itself, because an unrecognised self-report is used verbatim.
+  When nothing identifies the server the panel says `Unknown` rather than
+  guessing, and when sources disagree the strongest wins while the
+  conflicting evidence goes to the per-mailbox log. No extra network
+  operations: every signal is a by-product of the normal handshake.
+- **Expanded server identification.** The evidence-based engine now
+  recognises, from their own self-reports (IMAP greeting, RFC 2971 ID,
+  vendor-private capabilities): Dovecot, Courier IMAP, Cyrus IMAP,
+  Microsoft Exchange / Exchange Online, Zimbra, Axigen, SmarterMail,
+  MDaemon, Kerio Connect, MailEnable, WildDuck and Stalwart. It can also
+  identify SMTP servers from a 220 greeting banner — Postfix, Exim,
+  Sendmail, Microsoft Exchange, Zimbra, MDaemon, Kerio Connect, MailEnable,
+  SmarterMail, Stalwart and gromox (grommunio) — ahead of any SMTP support:
+  MailFerry does not speak SMTP yet, the engine is simply ready for the
+  greeting when it does. Bundled-component suites (mailcow, Mailu, iRedMail,
+  docker-mailserver) are deliberately NOT identified: they speak through the
+  Postfix and Dovecot they bundle, and the evidence names the software that
+  actually spoke — identifying the suite would require the fingerprinting
+  this design refuses to do. Still no hostname, provider or fingerprint
+  database; the only maintained mapping translates known protocol evidence
+  into clean display names, and no positive evidence still means `Unknown`.
+  Every supported product is covered by a named test.
+- **Adaptive Source/Destination panel for heterogeneous runs.** The panel
+  previously described a single "lead" mailbox, which is untrue of an MSP
+  batch migrating from several platforms at once. It now summarises each
+  side across every CONNECTED mailbox: when one identified platform serves a
+  side — even across several hosts — the detailed Host/Server/Auth/TLS/Speed
+  form is kept (multiple hosts show as `N hosts`, mixed mechanisms as
+  `OAuth (Microsoft) · Password`, and Speed becomes that side's summed
+  current throughput); when different platforms participate in one run, the
+  panel switches to `↓ Sources` / `↑ Destinations` with per-platform mailbox
+  counts, aggregated by identified platform — never by hostname — largest
+  first, with unidentified servers counted as `Unknown` and mailboxes that
+  have not yet connected counted as nothing at all. The F3 inspector remains
+  authoritative for any individual mailbox's exact live connection.
+- **`Sent/Rcvd` replaces `Wire RX/TX`** on the Dashboard — cumulative bytes
+  transferred by the whole migration, with the overall `Rate` immediately
+  below it. The two now answer clearly different questions (total traffic
+  versus throughput), and a test asserts neither is duplicated in the
+  connection panel.
+- **MULTIAPPEND visibility.** The Dashboard's run-information block now
+  carries a MULTIAPPEND line (`Active (Auto) avg 7.8`, `Not supported`,
+  `Disabled`, `Ready (Batch Size: 16)`, `Fallback (rejected)`), the F3
+  mailbox detail adds the per-mailbox state plus the destination's notable
+  advertised capabilities, F7 Performance reports messages/commands/average
+  batch/round trips saved, headless `--no-tui` output carries the same line
+  at detail level, and a destination that will be batched to gains an `MA`
+  connection badge. Still deliberately absent from the primary Mode line —
+  batching is an optimisation, not a run mode.
+- **`mailferry auth test` is now a staged operator diagnostic** rather than a
+  pass/fail. It reports the profile (provider, model, mailbox, tenant, when
+  it was authorised), then each stage separately — obtaining the access
+  token, connecting over TLS, authenticating SASL, and `LIST "" "*"` — so a
+  failure says *where* the chain broke. It finishes with the server's full
+  advertised capability list and a plain-language verdict on the ones that
+  affect a migration (MULTIAPPEND, UIDPLUS, LITERAL+, MOVE, CONDSTORE,
+  QRESYNC). A failed IMAP authentication prints the provider-specific check
+  to make first — typically `Set-CASMailbox -ImapEnabled $true`. The token's
+  length and remaining lifetime are shown; the token never is.
+- **Non-secret OAuth profile provenance.** Profiles record `authorised_at`,
+  shown by `auth list`, `auth show` and `auth test`, so an operator can see
+  how old a credential is. `auth test` additionally reports the live token's
+  expiry and flags a pre-provisioned token that cannot refresh. It never
+  writes to configuration — informational commands stay zero-side-effect.
+- **`docs/OAUTH-SETUP.md`** — a complete provider configuration guide for
+  system administrators and MSPs, verified against the official Microsoft and
+  Google documentation on 01/08/2026: prerequisites, Entra app registration,
+  the exact scopes and permission names, redirect URI rules (including the
+  `http://127.0.0.1` manifest workaround), admin consent, Exchange Online
+  service principal registration and per-mailbox scoping, Google Cloud OAuth
+  clients, service accounts and domain-wide delegation, headless flows,
+  testing, common mistakes, troubleshooting and least-privilege guidance.
+  Examples use only RFC 2606 / RFC 6761 reserved namespaces.
+- **Accurate run-mode presentation** — one authoritative representation of a
+  run's active characteristics (`config.RunMode`) drives every surface: the
+  startup banner, Dashboard, Results, headless summary, session log
+  (machine-readable `modes=`) and — from the **persisted** run record — the
+  attach monitor. A dry run is never shown as a plain migration; Date Range,
+  Portable, Ephemeral, Backup (flag sync) and Baseline are surfaced when
+  active, with ordinary tuning flags deliberately excluded. Rendered as
+  `Migration & Sync · Dry Run · Date Range` in the TUI and comma-separated in
+  plain text, from the same underlying data.
+- **Interactive F9 Settings**: the Settings view is now a real editor —
+  browse categorised options (Migration, Network & Retry, Recovery, Logging,
+  Interface, State Database & Cluster), edit them (toggle booleans, cycle
+  enums, step or type numerics), see unsaved-change and CLI-override
+  indicators, then Save to write `mailferry.toml` atomically with comments
+  preserved, or Esc to discard. Validation happens before any write, so an
+  invalid value can never corrupt the file; a CLI-overridden value is not
+  silently persisted; display-cadence changes apply live, others on the next
+  run. Read-only runtime/cluster facts stay clearly separated. Opening,
+  viewing or cancelling writes nothing (the zero-side-effect contract holds).
+- **Expanded mailferry.toml** via a single typed option catalogue shared by
+  file loading, `mailferry config` and F9 (no drift): new `[network]`
+  section (`timeout_seconds`, `compress`) plus `migration.order` and
+  `migration.skip_completed`.
+- **Completion date/time on the Results screen** and the headless summary,
+  captured once when the run reaches its terminal state (never re-stamped),
+  shown in the operator's regional format where reliably detectable with an
+  unambiguous ISO 8601 fallback, and contextually labelled
+  (Completed / Interrupted / Finished).
+
+### Changed
+
+- **Redesigned F6 Errors / Failed Messages** view: a master/detail screen in
+  the Results visual language that clearly separates run-level Errors &
+  Warnings from the Failed Message Registry, decodes RFC 2047 subjects,
+  aligns columns responsively, shows full detail (subject, reason, retry
+  status) for the selection, and always states the overall status
+  truthfully — it never claims "all clear" while failures are outstanding.
+- **Unified interactive exit contract**: every interactive TUI exit path
+  (complete, warnings, nothing-new, dry-run, interrupted, failed; q/Esc/
+  Ctrl+C/double-Ctrl+C/SIGHUP) now lands on the Results screen and leaves the
+  same concise shell acknowledgement — no second report dump, consistent
+  across outcomes. An interrupted run gets the Results screen too. Headless
+  output is unchanged (full structured summary).
+
+### Fixed
+
+- IMAP connect address now uses `net.JoinHostPort`, so IPv6 literal hosts
+  dial correctly (`[::1]:993`); hostnames and IPv4 are unaffected.
+- **Cancelling a run no longer abandons appends already on the wire.** A
+  stopped transfer now settles the append commands it has already sent before
+  unwinding, so each message's outcome is recorded instead of left ambiguous.
+  Previously those messages stayed `inflight` while the destination was still
+  committing them, and a resume could scan, fail to see them yet, and copy
+  them a second time. The window is bounded by the append window, so
+  cancellation remains prompt. Found by a new cancellation stress test
+  (`TestMultiAppendCancelResumeNeverDuplicates`), which cancels at six
+  different points, batched and unbatched, and asserts an exact-once result
+  after resume.
+- **A starting migration could fail if something was watching it.** A
+  brand-new State Database is created in rollback-journal mode, and the
+  switch to WAL needs a moment with no other connection attached. SQLite does
+  **not** apply `busy_timeout` to `PRAGMA journal_mode`, so a read-only
+  observer opening the file at that instant — `mailferry attach` polling for
+  a run that is just starting is exactly this — could abort the migration
+  with `database is locked` before it began. Schema initialisation now
+  retries briefly on lock contention. The window was milliseconds and the
+  observer never holds the lock, so the race is closed completely.
+- `keychain:` secret references are now resolvable on Linux (Secret Service
+  via `secret-tool`). Previously `auth add` could store a credential there and
+  write a reference that only macOS could read back.
 
 ## [2.0.3] - 2026-07-19
 
@@ -670,7 +1005,8 @@ Engine.
   suite (34 checks).
 - Packaging: standalone `mailferry.pyz` (zipapp), source archive, wheel.
 
-[Unreleased]: https://github.com/ajsap/mailferry/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/ajsap/mailferry/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/ajsap/mailferry/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/ajsap/mailferry/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/ajsap/mailferry/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/ajsap/mailferry/compare/v2.0.0...v2.0.1

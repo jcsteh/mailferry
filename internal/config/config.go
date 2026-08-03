@@ -39,6 +39,13 @@ type MailboxSpec struct {
 	Index int
 	Src   Endpoint
 	Dst   Endpoint
+	// SrcAuth / DstAuth name an [oauth.<name>] profile when that endpoint
+	// authenticates with OAuth instead of a password. Empty = password
+	// LOGIN (the unchanged, backward-compatible default). The reference is
+	// carried in the CSV's password column as "oauth:<name>", so the
+	// canonical 10-column format is untouched.
+	SrcAuth string
+	DstAuth string
 }
 
 func (m MailboxSpec) Label() string { return m.Src.User + "@" + m.Src.Host }
@@ -93,9 +100,22 @@ type Run struct {
 	BatchBytes        int64
 	FetchWindow       int
 	AppendWindow      int
-	TLSVerify         bool
-	RefreshMS         int
-	RunID             string
+
+	// MultiAppend controls the optional IMAP MULTIAPPEND (RFC 3502)
+	// optimisation on the DESTINATION connection: "auto" (use it whenever
+	// the destination advertises the capability — the default) or "off"
+	// (never use it; every message is uploaded with its own APPEND).
+	// It is an optimisation only: it never changes what is migrated, and an
+	// unsupported destination is never an error.
+	MultiAppend string
+	// MultiAppendBatch is how many messages may be grouped into ONE
+	// MULTIAPPEND command: "auto" (MailFerry sizes each batch from message
+	// sizes, aggregate bytes and the configured concurrency — the default)
+	// or a fixed count. It is NOT concurrency: see Workers for that.
+	MultiAppendBatch string
+	TLSVerify        bool
+	RefreshMS        int
+	RunID            string
 
 	// DryRun is the general-purpose zero-mutation mode (feature: --dry-run):
 	// the engine plans, scans and analyses adoption exactly as a real run
@@ -110,6 +130,11 @@ type Run struct {
 	// run creation (see ResolveRange) and persisted so a resume of the same run
 	// applies the identical window.
 	Range DateRange
+
+	// OAuthProfiles are the [oauth.<name>] profiles loaded from the config
+	// file, keyed by name. A mailbox row references one by an "oauth:<name>"
+	// password cell. Empty for password-only deployments.
+	OAuthProfiles map[string]OAuthProfile
 }
 
 // NewRunID: unique per invocation — timestamp plus random suffix, so
@@ -132,6 +157,7 @@ func Defaults() *Run {
 		IsolateFailed: true, SkipKnownFailed: true,
 		LogKeepDays: 30, DBHeartbeat: 15,
 		MsgRetries: 3, BatchBytes: 8 << 20, FetchWindow: 8, AppendWindow: 8,
+		MultiAppend: "auto", MultiAppendBatch: "auto",
 		TLSVerify: true, RefreshMS: 250, Compress: "auto",
 		RunID: NewRunID(),
 	}
@@ -272,12 +298,19 @@ func ValidateCSV(path string) ([]MailboxSpec, error) {
 		if rowErrs > 0 {
 			continue // do not admit a row that carries any error
 		}
+		// OAuth reference: an "oauth:<profile>" password selects modern auth
+		// for that endpoint. The profile name is moved to Src/DstAuth and the
+		// password is cleared so nothing downstream ever treats the reference
+		// as a literal secret. Any other value is an unchanged password.
+		srcPass, srcAuth := splitAuthRef(get(row, "srcpassword"))
+		dstPass, dstAuth := splitAuthRef(get(row, "dstpassword"))
 		out = append(out, MailboxSpec{
 			Index: len(out) + 1,
 			Src: Endpoint{Host: get(row, "srchost"), Port: sport,
-				Security: ssec, User: get(row, "srcuser"), Password: get(row, "srcpassword")},
+				Security: ssec, User: get(row, "srcuser"), Password: srcPass},
 			Dst: Endpoint{Host: get(row, "dsthost"), Port: dport,
-				Security: dsec, User: get(row, "dstuser"), Password: get(row, "dstpassword")},
+				Security: dsec, User: get(row, "dstuser"), Password: dstPass},
+			SrcAuth: srcAuth, DstAuth: dstAuth,
 		})
 	}
 	if len(errs) > 0 {
@@ -287,6 +320,21 @@ func ValidateCSV(path string) ([]MailboxSpec, error) {
 		return nil, fmt.Errorf("CSV has a header but no mailbox rows")
 	}
 	return out, nil
+}
+
+// authRefPrefix marks a CSV password cell as an OAuth profile reference
+// rather than a literal password: "oauth:work" → profile "work".
+const authRefPrefix = "oauth:"
+
+// splitAuthRef separates a password cell into (password, oauthProfile).
+// A cell beginning with "oauth:" is an OAuth reference: the password is
+// cleared and the profile name returned. Everything else is a password,
+// unchanged — so existing password CSVs behave exactly as before.
+func splitAuthRef(cell string) (password, oauthProfile string) {
+	if strings.HasPrefix(cell, authRefPrefix) {
+		return "", strings.TrimSpace(strings.TrimPrefix(cell, authRefPrefix))
+	}
+	return cell, ""
 }
 
 // validateHeader checks the header row exactly: every canonical column must

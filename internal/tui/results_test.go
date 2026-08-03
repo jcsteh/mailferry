@@ -29,10 +29,19 @@ import (
 func TestResultsShotSuccess(t *testing.T) {
 	f := RenderShot("results-success")
 	for _, want := range []string{"MIGRATION COMPLETE", "Run", "Messages",
-		"Mailboxes (8)", "COMPLETED", "Success rate", "Q/Esc Quit"} {
+		"Mailboxes (8)", "COMPLETED", "Success rate"} {
 		if !strings.Contains(f, want) {
 			t.Fatalf("success frame lacks %q:\n%s", want, f)
 		}
+	}
+	// The Results screen must offer a way out, and it must NOT advertise Esc
+	// as one: Esc means "back", and quitting always goes through the
+	// confirmation (see quit.go).
+	if !strings.Contains(f, "Quit") {
+		t.Fatalf("success frame offers no quit affordance:\n%s", f)
+	}
+	if strings.Contains(f, "Esc Quit") || strings.Contains(f, "Q/Esc Quit") {
+		t.Fatalf("Esc must not be advertised as a quit key:\n%s", f)
 	}
 	if strings.Contains(f, "Needs attention") {
 		t.Fatal("clean success must not show the attention panel")
@@ -67,6 +76,19 @@ func TestResultsShotNothingNew(t *testing.T) {
 	for _, want := range []string{"NOTHING NEW TO COPY", "Adopted", "(100%)"} {
 		if !strings.Contains(f, want) {
 			t.Fatalf("nothing-new frame lacks %q:\n%s", want, f)
+		}
+	}
+}
+
+// TestResultsShotDryRunMode: the Results screen shows the authoritative
+// run-mode line (Dry Run · Date Range) and never presents a dry run as a
+// plain migration; the destination write count is zero.
+func TestResultsShotDryRunMode(t *testing.T) {
+	f := RenderShot("results-dryrun")
+	for _, want := range []string{"DRY RUN COMPLETE", "Migration & Sync · Dry Run · Date Range",
+		"Would copy"} {
+		if !strings.Contains(f, want) {
+			t.Fatalf("dry-run frame lacks %q:\n%s", want, f)
 		}
 	}
 }
@@ -107,7 +129,7 @@ func TestResultsAndHeadlessShareOneTruth(t *testing.T) {
 	os.Stdout = wp
 	cfg := config.Defaults()
 	cfg.RunID, cfg.LogsDir, cfg.DBPath = "truth-test", t.TempDir(), "test.db"
-	report.PrintSummary(snap, "results.csv", cfg, 3600, false,
+	report.PrintSummary(snap, "results.csv", cfg, 3600, now, false,
 		func(s, _ string) string { return s })
 	wp.Close()
 	os.Stdout = oldStdout

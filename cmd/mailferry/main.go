@@ -60,7 +60,7 @@ var commands = map[string]bool{"run": true, "resume": true, "check": true,
 	"import-state": true, "capabilities": true, "verify": true, "compact": true,
 	"changelog": true, "roadmap": true, "status": true, "failed": true,
 	"retry-failed": true, "config": true, "version": true, "about": true,
-	"dedup": true, "attach": true, "term-diag": true}
+	"dedup": true, "attach": true, "term-diag": true, "auth": true}
 
 // bootCfg is the file-configured baseline every command starts from.
 // mailferry.toml: sensible defaults that just work; the file only exists so
@@ -166,6 +166,14 @@ func run(argv []string) int {
 	}
 	switch argv[0] {
 	case "--version", "-V", "version":
+		// `version --bare` prints just the SemVer string, with no product
+		// name, banner or decoration. It exists so build.sh, release
+		// tooling and CI read the ONE authoritative version definition
+		// instead of parsing source or keeping a copy of their own.
+		if len(argv) > 1 && (argv[1] == "--bare" || argv[1] == "--short") {
+			fmt.Println(identity.Version)
+			return 0
+		}
 		fmt.Print(identity.VersionText())
 		return 0
 	case "--help", "-h", "help":
@@ -217,6 +225,8 @@ func run(argv []string) int {
 		return cmdDedup(rest)
 	case "attach":
 		return cmdAttach(rest)
+	case "auth":
+		return cmdAuth(rest)
 	case "term-diag":
 		return cmdTermDiag(rest)
 	case "run", "resume", "check", "validate":
@@ -239,6 +249,7 @@ Usage:
   mailferry validate CSV         alias of check
   mailferry status [--db PATH]   inspect a State Database (read-only, safe anytime)
   mailferry attach [RUN-ID]      live read-only monitor of a running migration
+  mailferry auth ...             OAuth profiles: add / list / show / test / refresh / remove
   mailferry failed               list / export the Failed Message Registry
   mailferry retry-failed         re-queue registry entries for the next run
   mailferry dedup CSV            find/quarantine destination duplicates (safe; --execute)
@@ -261,6 +272,8 @@ Frequent flags: --workers N --db PATH (native per-user mailferry.db
   --retries N --retry-delay S --per-host-conns N --skip-completed
   --order csv|size --include GLOB --exclude GLOB --map FILE --sync-flags
   --compress auto|off --baseline --tls-no-verify --no-tui --trace --config PATH
+  --multiappend auto|off --multiappend-batch-size auto|N
+    (batch size groups messages into ONE append command; --workers is concurrency)
   --portable (run entirely from the executable's own directory)
 Run 'mailferry run -h' for the full list.
 
@@ -354,6 +367,8 @@ func cmdRun(cmd string, rest []string) int {
 		lockTimeout  = fs.Float64("lock-timeout", 0, "A lease with no heartbeat for this long is stale (s)")
 		resetStale   = fs.Bool("reset-stale-locks", false, "Compatibility no-op: dead workers are reclaimed automatically (see --worker-timeout)")
 		compress     = fs.String("compress", "", "COMPRESS=DEFLATE when the server offers it: auto | off")
+		multiApp     = fs.String("multiappend", "", "Group messages into one IMAP append command when the destination supports it: auto | off")
+		multiAppN    = fs.String("multiappend-batch-size", "", "Messages per append command: auto | N (this is NOT --workers)")
 		baseline     = fs.Bool("baseline", false, "RFC-3501-only conservative mode (no LITERAL+/COMPRESS)")
 		tlsNoVerify  = fs.Bool("tls-no-verify", false, "Disable TLS certificate verification")
 		mapFile      = fs.String("map", "", "Folder mapping file: lines of 'Source Name = Dest Name'")
@@ -456,6 +471,25 @@ func cmdRun(cmd string, rest []string) int {
 		}
 		cfg.Compress = *compress
 	}
+	// MULTIAPPEND is an optimisation, so both overrides validate through the
+	// SAME catalogue entries the TOML file and F9 Settings use — one set of
+	// accepted values, one set of bounds, no second opinion.
+	if *multiApp != "" {
+		o, _ := config.FindOption("migration.multiappend")
+		if !o.Set(cfg, *multiApp) {
+			fmt.Fprintln(os.Stderr, "ERROR: --multiappend must be auto or off")
+			return 2
+		}
+	}
+	if *multiAppN != "" {
+		o, _ := config.FindOption("migration.multiappend_batch_size")
+		if !o.Set(cfg, *multiAppN) {
+			fmt.Fprintf(os.Stderr, "ERROR: --multiappend-batch-size must be auto or a "+
+				"count from 2 to %d (it groups messages into one append command; "+
+				"use --workers for concurrency)\n", config.MABatchSizeMax)
+			return 2
+		}
+	}
 	cfg.Baseline = *baseline
 	if *tlsNoVerify {
 		cfg.TLSVerify = false
@@ -533,6 +567,13 @@ func cmdRun(cmd string, rest []string) int {
 		fmt.Fprintln(os.Stderr, "ERROR:", err)
 		return 1
 	}
+	// OAuth: load [oauth.<name>] profiles (references only, never secrets)
+	// and validate every profile a mailbox references BEFORE any connection,
+	// alongside the whole-file CSV validation. Password-only runs are
+	// unaffected (no profiles, no references).
+	if !loadAndValidateOAuth(cfg, specs) {
+		return 2
+	}
 	if cfg.CheckOnly {
 		return runCheck(cfg, specs) // preflight: nothing written locally
 	}
@@ -598,6 +639,11 @@ func cmdRun(cmd string, rest []string) int {
 	}
 	stats := engine.NewStats()
 	stats.CSVFile = filepath.Base(cfg.CSVFile)
+	// Authoritative run mode — computed once, here, then rendered by every
+	// surface (banner, dashboard, Results, headless, reports) and persisted
+	// to the run record so attach reflects the run's real characteristics.
+	runMode := config.RunModeOf(cfg, paths.PortableActive())
+	stats.Mode = runMode.Display()
 	stats.DBPath = cfg.DBPath
 	if cfg.Ephemeral {
 		stats.DBPath = "(ephemeral)"
@@ -618,6 +664,12 @@ func cmdRun(cmd string, rest []string) int {
 	fmt.Println()
 	fmt.Printf("Starting migration: %d mailbox(es), %d worker(s), State Database %s\n",
 		len(specs), cfg.Workers, stats.DBPath)
+	// Authoritative mode line — shown only when a significant modifier is
+	// active, so a plain run stays uncluttered while Dry Run / Date Range /
+	// Portable / Backup / Baseline are always visible.
+	if len(runMode.Modifiers) > 0 {
+		fmt.Println("Mode: " + progress.C(runMode.Display(), "cyan"))
+	}
 	fmt.Printf("Run %s · worker %s — multiple MailFerry processes may share this "+
 		"State Database safely\n", cfg.RunID, state.ShortWorker(state.LeaseOwnerID()))
 	termstate.Snapshot("post-banner")
@@ -628,8 +680,9 @@ func cmdRun(cmd string, rest []string) int {
 	if cfg.Range.Active {
 		fmt.Printf("Date range: %s\n", cfg.Range.Label())
 	}
-	session.Log(fmt.Sprintf("=== %s — run %s start: csv=%s rows=%d workers=%d db=%s%s%s%s%s",
+	session.Log(fmt.Sprintf("=== %s — run %s start: csv=%s rows=%d workers=%d db=%s modes=%q%s%s%s%s",
 		identity.BannerLine(), cfg.RunID, stats.CSVFile, len(specs), cfg.Workers, stats.DBPath,
+		runMode.Machine(),
 		map[bool]string{true: " force"}[cfg.Force], map[bool]string{true: " ephemeral"}[cfg.Ephemeral],
 		map[bool]string{true: " dry-run"}[cfg.DryRun],
 		map[bool]string{true: " range=" + cfg.Range.Label()}[cfg.Range.Active]))
@@ -644,9 +697,13 @@ func cmdRun(cmd string, rest []string) int {
 
 	var res engine.RunResult
 	var runErr error
-	resultsShown := false
+	tuiClean := false
 	if interactive {
-		res, runErr, interrupted, resultsShown = runInteractive(ctx, cancel, cfg, specs, stats, bus, session)
+		settingsCtx := &tui.SettingsCtx{
+			Cfg: cfg, ConfigPath: bootPath, CLISet: cliOverrideSet(fs),
+		}
+		res, runErr, interrupted, tuiClean = runInteractive(
+			ctx, cancel, cfg, specs, stats, bus, session, settingsCtx)
 	} else {
 		res, runErr, interrupted = runHeadless(ctx, cancel, cfg, specs, stats, bus, session)
 	}
@@ -664,11 +721,26 @@ func cmdRun(cmd string, rest []string) int {
 		res.Counts["FAILED"], res.Counts["STALE"], res.Counts["CANCELLED"],
 		map[bool]string{true: " (interrupted)"}[interrupted]))
 	termstate.Snapshot("pre-report")
-	if resultsShown && !interrupted {
-		// The operator reviewed the Results screen inside the TUI and quit
-		// deliberately — print a short confirmation, never a second report.
-		fmt.Printf("Run %s complete: %d successful · %d with warnings · %d failed\n",
-			cfg.RunID, res.Counts["SUCCESS"], res.Counts["WARNINGS"], res.Counts["FAILED"])
+	if tuiClean {
+		// THE INTERACTIVE POST-EXIT CONTRACT — identical on every TUI exit
+		// path (complete, warnings, nothing-new, dry-run, interrupted,
+		// failed; q/Esc/Ctrl+C/double-Ctrl+C/SIGHUP): the Results screen was
+		// the report, so the shell gets a concise, consistent
+		// acknowledgement — never a second report, never a different layout
+		// per outcome. Headless output is unaffected (structured summary).
+		verb := "complete"
+		if interrupted {
+			verb = "interrupted"
+		}
+		line := fmt.Sprintf("Run %s %s: %d successful · %d with warnings · %d failed",
+			cfg.RunID, verb, res.Counts["SUCCESS"], res.Counts["WARNINGS"], res.Counts["FAILED"])
+		if n := res.Counts["CANCELLED"]; n > 0 {
+			line += fmt.Sprintf(" · %d cancelled", n)
+		}
+		if cfg.DryRun {
+			line += " — dry run, nothing was written"
+		}
+		fmt.Println(line)
 		fmt.Println("Results: " + resultsPath + " · logs: " + cfg.LogsDir)
 		if res.Outstanding > 0 {
 			fmt.Println(progress.C(fmt.Sprintf(
@@ -676,7 +748,7 @@ func cmdRun(cmd string, rest []string) int {
 				res.Outstanding), "yellow"))
 		}
 	} else {
-		report.PrintSummary(snap, resultsPath, cfg, runtimeS, interrupted, progress.C)
+		report.PrintSummary(snap, resultsPath, cfg, runtimeS, res.FinishedAt, interrupted, progress.C)
 		if n := res.Counts["REMOTE"]; n > 0 {
 			fmt.Println(progress.C(fmt.Sprintf("Handled by other workers : %d mailbox(es) were "+
 				"actively owned by other MailFerry processes (details above and in the "+
@@ -707,6 +779,69 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 		}
 	})
 	return set
+}
+
+// cliFlagToOption maps a `run` flag name to the config option it overrides,
+// so F9 Settings can honestly mark "CLI flag overrides this run" and never
+// imply an edit changes a value a flag is currently winning. Several flags
+// legitimately share an option (retries/no-retry, debug/trace).
+var cliFlagToOption = map[string]string{
+	"workers":                "migration.parallel_mailboxes",
+	"max-conns-per-mailbox":  "migration.parallel_folders",
+	"per-host-conns":         "migration.per_host_connections",
+	"order":                  "migration.order",
+	"skip-completed":         "migration.skip_completed",
+	"timeout":                "network.timeout_seconds",
+	"compress":               "network.compress",
+	"multiappend":            "migration.multiappend",
+	"multiappend-batch-size": "migration.multiappend_batch_size",
+	"batch-attempts":         "retry.batch_attempts",
+	"message-attempts":       "retry.message_attempts",
+	"reconnect-attempts":     "retry.reconnect_attempts",
+	"retries":                "retry.mailbox_attempts",
+	"no-retry":               "retry.mailbox_attempts",
+	"retry-delay":            "retry.retry_delay",
+	"no-isolate":             "recovery.isolate_failed_messages",
+	"no-skip-failed":         "recovery.skip_known_failed_messages",
+	"stale-timeout":          "recovery.stale_timeout_seconds",
+	"recovery-retries":       "recovery.recovery_retries",
+	"recovery-interval":      "recovery.recovery_interval_seconds",
+	"debug":                  "logging.level",
+	"trace":                  "logging.level",
+	"worker-timeout":         "database.worker_timeout_seconds",
+	"lock-timeout":           "database.lock_timeout_seconds",
+}
+
+// cliOverrideSet returns the option names a CLI flag set this invocation.
+func cliOverrideSet(fs *flag.FlagSet) map[string]bool {
+	out := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		if opt, ok := cliFlagToOption[f.Name]; ok {
+			out[opt] = true
+		}
+	})
+	return out
+}
+
+// loadAndValidateOAuth loads OAuth profiles from the resolved config file and
+// validates every profile the CSV references. It returns false (and prints
+// an actionable error) on any problem. Profiles hold external secret
+// references only — this never reads a secret or contacts a provider.
+func loadAndValidateOAuth(cfg *config.Run, specs []config.MailboxSpec) bool {
+	profiles, warns, err := config.LoadOAuthProfiles(bootPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		return false
+	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, progress.C("note: "+w, "yellow"))
+	}
+	cfg.OAuthProfiles = profiles
+	if err := config.ValidateOAuth(specs, profiles); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		return false
+	}
+	return true
 }
 
 const graceSeconds = 6 // bounded escalation after a graceful stop request
@@ -761,7 +896,7 @@ func escalate(bus *engine.Bus, session *report.Session, done <-chan struct{}) {
 // lost terminal can never corrupt migration state.
 func runInteractive(ctx context.Context, cancel context.CancelFunc,
 	cfg *config.Run, specs []config.MailboxSpec, stats *engine.Stats, bus *engine.Bus,
-	session *report.Session) (engine.RunResult, error, bool, bool) {
+	session *report.Session, settingsCtx *tui.SettingsCtx) (engine.RunResult, error, bool, bool) {
 	session.Log(fmt.Sprintf("=== %s — run %s start (TUI): rows=%d workers=%d db=%s",
 		identity.BannerLine(), cfg.RunID, len(specs), cfg.Workers, cfg.DBPath))
 	var res engine.RunResult
@@ -798,6 +933,7 @@ func runInteractive(ctx context.Context, cancel context.CancelFunc,
 					ResultsCSV: resultsCSV, FailedCSV: failedCSV,
 					SessionLog: filepath.Join(cfg.LogsDir, "session.log"),
 					Runtime:    time.Since(snapNow.BatchStart).Seconds(),
+					Modes:      config.RunModeOf(cfg, paths.PortableActive()).Modifiers,
 				}
 			}
 			close(resCh)
@@ -808,12 +944,14 @@ func runInteractive(ctx context.Context, cancel context.CancelFunc,
 	}()
 	hardRequested := false
 	gracefulStop := func() {
+		stats.Interrupted = true
 		session.Log("interrupt received (Ctrl+C) — graceful stop: no new work, active " +
 			"workers finish the current message, then connections close")
 		cancel()
 		escalate(bus, session, done)
 	}
 	hardStop := func() {
+		stats.Interrupted = true
 		// NEVER os.Exit while Bubble Tea owns the terminal: abort the
 		// engine, let the TUI quit and restore the terminal, then the
 		// bounded wait below finishes the process.
@@ -823,7 +961,7 @@ func runInteractive(ctx context.Context, cancel context.CancelFunc,
 		cancel()
 	}
 	model := tui.New(stats, bus, gracefulStop, hardStop,
-		time.Duration(cfg.RefreshMS)*time.Millisecond, done)
+		time.Duration(cfg.RefreshMS)*time.Millisecond, done).WithSettings(settingsCtx)
 	restoreTerm := captureTerminal()
 	termstate.Snapshot("pre-tui")
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -840,21 +978,18 @@ func runInteractive(ctx context.Context, cancel context.CancelFunc,
 	signal.Notify(hupCh, syscall.SIGHUP)
 	go func() {
 		if _, ok := <-hupCh; ok {
+			stats.Interrupted = true
 			session.Log("SIGHUP received (terminal hangup) — graceful stop; " +
 				"terminal state restored, state committed per message")
 			cancel()
 			p.Send(tea.QuitMsg{})
 		}
 	}()
-	finalModel, runUIErr := p.Run()
+	_, runUIErr := p.Run()
 	signal.Stop(hupCh)
 	close(hupCh)
 	restoreTerm() // guarantee: cooked mode + primary screen on EVERY path
 	termstate.Snapshot("post-tui")
-	resultsShown := false
-	if mm, ok := finalModel.(*tui.Model); ok {
-		resultsShown = mm.ResultsShown()
-	}
 	if runUIErr != nil {
 		// TUI failed: never abort the migration — fall back to waiting headless
 		fmt.Fprintln(os.Stderr, "note: TUI unavailable (", runUIErr, ") — continuing headless")
@@ -871,7 +1006,12 @@ func runInteractive(ctx context.Context, cancel context.CancelFunc,
 	} else {
 		<-done
 	}
-	return res, runErr, ctx.Err() != nil, resultsShown
+	// The fourth value is the TUI-clean flag: the Bubble Tea program owned
+	// the screen and exited normally, so the operator already had the full
+	// Results surface (or explicitly forced out) — the shell gets the
+	// concise acknowledgement, never a second report. A failed TUI falls
+	// back to the headless contract instead.
+	return res, runErr, ctx.Err() != nil, runUIErr == nil
 }
 
 // runHeadless runs the same engine with clean structured console output.
@@ -1259,7 +1399,10 @@ func cmdChangelog(rest []string) int {
 		fmt.Println(strings.TrimRight(mailferry.Changelog, "\n"))
 		return 0
 	}
-	version := identity.Version
+	// CHANGELOG sections are keyed on the SEMANTIC version — a release
+	// candidate documents the release it is a candidate for, so v2.1.0-RC1
+	// reads the [2.1.0] section rather than looking for one of its own.
+	version := identity.Core
 	if fs.NArg() > 0 {
 		version = strings.TrimPrefix(fs.Arg(0), "v")
 	}
@@ -1274,7 +1417,7 @@ func cmdChangelog(rest []string) int {
 	}
 	if text, ok := section(version); ok {
 		fmt.Println(text)
-	} else if text, ok := section("Unreleased"); ok && version == identity.Version {
+	} else if text, ok := section("Unreleased"); ok && version == identity.Core {
 		// The running version has not been released yet (release candidate):
 		// show the in-progress notes rather than nothing.
 		fmt.Println("(v" + version + " is not released yet — showing the [Unreleased] notes)\n")
@@ -1295,6 +1438,8 @@ func cmdBenchmark(rest []string) int {
 	nMsgs := fs.Int("messages", 2000, "Messages in the synthetic mailbox")
 	msgKB := fs.Int("size-kb", 32, "Approximate message size (KB)")
 	workers := fs.Int("workers", 4, "Concurrent folder pipelines")
+	multiApp := fs.String("multiappend", "", "MULTIAPPEND for this benchmark: auto | off")
+	multiAppN := fs.String("multiappend-batch-size", "", "Messages per append command: auto | N")
 	fs.Parse(reorderArgs(fs, rest))
 	fmt.Printf("%s\n%s\n\nLoopback benchmark: %d messages × ~%d KB, in-process servers.\n"+
 		"This measures the engine + protocol stack — real migrations are network-bound.\n\n",
@@ -1335,6 +1480,19 @@ func cmdBenchmark(rest []string) int {
 	cfg.MaxConnsPerBox = *workers
 	cfg.StaleTimeout = 0
 	cfg.RunID = time.Now().Format("20060102-150405")
+	for name, v := range map[string]*string{
+		"migration.multiappend": multiApp, "migration.multiappend_batch_size": multiAppN,
+	} {
+		if *v == "" {
+			continue
+		}
+		o, _ := config.FindOption(name)
+		if !o.Set(cfg, *v) {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid value %q for %s\n", *v, name)
+			return 1
+		}
+	}
+	policy := cfg.MultiAppendPolicyFor()
 	specs := []config.MailboxSpec{{Index: 1,
 		Src: config.Endpoint{Host: "127.0.0.1", Port: src.Port(), Security: "none",
 			User: "bench", Password: "pw"},
@@ -1361,6 +1519,19 @@ func cmdBenchmark(rest []string) int {
 		util.FmtBytes(float64(agg.WireRX)), util.FmtBytes(float64(agg.WireTX)))
 	fmt.Printf("  Memory       %s heap in use · %d goroutine peak est.\n",
 		util.FmtBytes(float64(ms.HeapInuse)), runtime.NumGoroutine())
+	// Protocol evidence: how many APPEND *commands* carried how many
+	// messages. This is measured, not asserted — the destination server
+	// counts them.
+	cmds := dst.AppendCmds.Load()
+	fmt.Printf("  MULTIAPPEND  %s\n", policy.Describe())
+	if cmds > 0 {
+		fmt.Printf("  Append cmds  %d command(s) for %d message(s) — %.2f messages per command",
+			cmds, dst.AppendCount.Load(), float64(dst.AppendCount.Load())/float64(cmds))
+		if b := dst.MaxBatchSeen.Load(); b > 1 {
+			fmt.Printf(" (largest batch %d)", b)
+		}
+		fmt.Println()
+	}
 	fmt.Printf("  Result       %v\n", res.Counts)
 	fmt.Println("\nPublish comparisons only from identical hardware and identical corpora.")
 	return 0

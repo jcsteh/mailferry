@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/flate"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -150,9 +151,13 @@ func (f *Folder) bySet(set string) []*Msg {
 type Account struct {
 	User     string
 	Password string
-	mu       sync.Mutex
-	Folders  map[string]*Folder
-	order    []string
+	// OAuthToken, when set, enables SASL XOAUTH2 for this account: a client
+	// presenting exactly this bearer token authenticates. Password LOGIN
+	// still works too, so a single fixture can exercise both mechanisms.
+	OAuthToken string
+	mu         sync.Mutex
+	Folders    map[string]*Folder
+	order      []string
 }
 
 func NewAccount(user, password string) *Account {
@@ -197,8 +202,17 @@ type Server struct {
 	Accounts map[string]*Account
 	Caps     []string
 	Addr     string
+	// ServerName / ServerVersion are what this server reports for itself in
+	// its RFC 2971 ID response. Empty ServerName answers NIL — a server that
+	// declines to identify itself, which MailFerry must render as "Unknown"
+	// rather than inferring anything from the hostname.
+	ServerName    string
+	ServerVersion string
 
-	AppendCount   atomic.Int64
+	AppendCount   atomic.Int64 // MESSAGES appended (one per message, always)
+	AppendCmds    atomic.Int64 // APPEND *commands* seen (a MULTIAPPEND counts once)
+	MaxBatchSeen  atomic.Int64 // largest message count in a single APPEND command
+	MultiAppendN  atomic.Int64 // APPEND commands that carried more than one message
 	FetchBodyN    atomic.Int64
 	KillCount     atomic.Int64
 	CopyCount     atomic.Int64 // UID COPY commands honoured (dedup quarantine)
@@ -212,12 +226,24 @@ type Server struct {
 	DropAfterOKN  atomic.Int64 // kill AFTER sending OK for the Nth append (ack-loss test)
 	StallAfterN   atomic.Int64 // after N body fetches, stop responding (hung server)
 	StallOnce     atomic.Bool  // clear StallAfterN after the first stall (recover next conn)
-	StallCount    atomic.Int64
-	CompressConns atomic.Int64 // connections that negotiated COMPRESS=DEFLATE
-	storeMu       sync.Mutex
-	StoreLog      []string // "folder set items" per UID STORE (flag-sync tests)
-	mu            sync.Mutex
-	ln            net.Listener
+	// MULTIAPPEND behaviours. NoMultiAppend hides the capability entirely;
+	// MultiAppendBroken advertises it and then rejects it, which is the
+	// dangerous "server lied" case MailFerry must survive without
+	// duplicating mail. MultiAppendBAD makes that rejection a BAD (a parse
+	// failure) rather than a NO.
+	NoMultiAppend     atomic.Bool
+	MultiAppendBroken atomic.Bool
+	MultiAppendBAD    atomic.Bool
+	// DropBeforeOKBatch kills the connection after a MULTIAPPEND of this
+	// many messages has been fully stored but BEFORE the tagged OK is sent —
+	// the acknowledgement-loss case for a whole batch.
+	DropBeforeOKBatch atomic.Int64
+	StallCount        atomic.Int64
+	CompressConns     atomic.Int64 // connections that negotiated COMPRESS=DEFLATE
+	storeMu           sync.Mutex
+	StoreLog          []string // "folder set items" per UID STORE (flag-sync tests)
+	mu                sync.Mutex
+	ln                net.Listener
 }
 
 // StoreEvents returns a copy of the UID STORE audit log.
@@ -228,14 +254,19 @@ func (s *Server) StoreEvents() []string {
 }
 
 // capString renders the advertised capability list, honouring NoMove so
-// tests can force the copy+flag quarantine path on MOVE-less servers.
+// tests can force the copy+flag quarantine path on MOVE-less servers, and
+// advertising AUTH=XOAUTH2 whenever any account has an OAuth token set.
 func (s *Server) capString() string {
-	if !s.NoMove.Load() {
-		return strings.Join(s.Caps, " ")
+	caps := append([]string(nil), s.Caps...)
+	if s.offersXOAUTH2() {
+		caps = append(caps, "AUTH=XOAUTH2")
 	}
 	var out []string
-	for _, c := range s.Caps {
-		if strings.EqualFold(c, "MOVE") {
+	for _, c := range caps {
+		if s.NoMove.Load() && strings.EqualFold(c, "MOVE") {
+			continue
+		}
+		if s.NoMultiAppend.Load() && strings.EqualFold(c, "MULTIAPPEND") {
 			continue
 		}
 		out = append(out, c)
@@ -243,10 +274,45 @@ func (s *Server) capString() string {
 	return strings.Join(out, " ")
 }
 
+// offersXOAUTH2 reports whether any account accepts a bearer token.
+func (s *Server) offersXOAUTH2() bool {
+	for _, a := range s.Accounts {
+		if a.OAuthToken != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// authXOAUTH2 decodes a base64 XOAUTH2 initial response and returns the
+// matching account when the embedded bearer token is exactly the account's
+// OAuthToken. Format: "user=<u>\x01auth=Bearer <token>\x01\x01".
+func (s *Server) authXOAUTH2(ir string) *Account {
+	raw, err := base64.StdEncoding.DecodeString(ir)
+	if err != nil {
+		return nil
+	}
+	var user, token string
+	for _, part := range strings.Split(string(raw), "\x01") {
+		switch {
+		case strings.HasPrefix(part, "user="):
+			user = strings.TrimPrefix(part, "user=")
+		case strings.HasPrefix(part, "auth=Bearer "):
+			token = strings.TrimPrefix(part, "auth=Bearer ")
+		}
+	}
+	a := s.Accounts[user]
+	if a != nil && a.OAuthToken != "" && a.OAuthToken == token {
+		return a
+	}
+	return nil
+}
+
 func NewServer(accounts ...*Account) *Server {
 	s := &Server{Accounts: map[string]*Account{},
 		Caps: []string{"IMAP4rev1", "UIDPLUS", "LITERAL+", "NAMESPACE",
-			"SPECIAL-USE", "ID", "UNSELECT", "COMPRESS=DEFLATE", "MOVE"}}
+			"SPECIAL-USE", "ID", "UNSELECT", "COMPRESS=DEFLATE", "MOVE",
+			"MULTIAPPEND"}}
 	for _, a := range accounts {
 		s.Accounts[a.User] = a
 	}
@@ -370,7 +436,15 @@ func (s *Server) client(conn net.Conn) {
 		case "NOOP":
 			send(tag + " OK done")
 		case "ID":
-			send("* ID NIL")
+			// RFC 2971. ServerName lets a test present itself as any
+			// product — or as nothing, to exercise the "Unknown" path that
+			// MailFerry must prefer over guessing.
+			if s.ServerName == "" {
+				send("* ID NIL")
+			} else {
+				send(fmt.Sprintf(`* ID ("name" "%s" "version" "%s")`,
+					s.ServerName, s.ServerVersion))
+			}
 			send(tag + " OK done")
 		case "NAMESPACE":
 			send(`* NAMESPACE (("" "/")) NIL NIL`)
@@ -399,6 +473,26 @@ func (s *Server) client(conn net.Conn) {
 				}
 			}
 			send(tag + " NO [AUTHENTICATIONFAILED] bad credentials")
+		case "AUTHENTICATE":
+			// SASL XOAUTH2 with the initial-response (SASL-IR) form both
+			// first-class providers use: AUTHENTICATE XOAUTH2 <base64>.
+			mech, ir, _ := strings.Cut(strings.TrimSpace(rest), " ")
+			if !strings.EqualFold(mech, "XOAUTH2") {
+				send(tag + " NO unsupported SASL mechanism")
+				continue
+			}
+			if a := s.authXOAUTH2(ir); a != nil {
+				acct = a
+				send(tag + " OK [CAPABILITY " + s.capString() + "] authenticated")
+				continue
+			}
+			// Provider behaviour on a bad token: a base64 error continuation,
+			// then wait for the client's empty line before the tagged NO.
+			send("+ eyJzdGF0dXMiOiI0MDEiLCJzY2hlbWVzIjoiQmVhcmVyIn0=")
+			if _, rerr := br.ReadString('\n'); rerr != nil {
+				return
+			}
+			send(tag + " NO [AUTHENTICATIONFAILED] invalid bearer token")
 		case "LOGOUT":
 			send("* BYE bye")
 			send(tag + " OK done")
@@ -594,8 +688,12 @@ func (s *Server) client(conn net.Conn) {
 				s.ExpungeCount.Add(1)
 				send(tag + " OK expunge done")
 			case "APPEND":
-				head := strings.Split(rest, "\x00LIT\x00")[0]
-				t := toks(head)
+				// One APPEND command carries 1..N messages (RFC 3502
+				// MULTIAPPEND). Each literal was replaced by a \x00LIT\x00
+				// marker above, so the segments around the markers are the
+				// per-message [flags] [date] parts, in order.
+				segs := strings.Split(rest, "\x00LIT\x00")
+				t := toks(segs[0])
 				if len(t) == 0 {
 					send(tag + " BAD append")
 					continue
@@ -605,40 +703,72 @@ func (s *Server) client(conn net.Conn) {
 					send(tag + " NO [TRYCREATE] no such folder")
 					continue
 				}
-				var flags []string
-				if mm := regexp.MustCompile(`\(([^)]*)\)`).FindStringSubmatch(head); mm != nil {
-					for _, fl := range strings.Fields(mm[1]) {
-						if !strings.EqualFold(fl, `\Recent`) {
-							flags = append(flags, fl)
+				s.AppendCmds.Add(1)
+				if n := int64(len(lits)); n > 1 {
+					s.MultiAppendN.Add(1)
+					for {
+						cur := s.MaxBatchSeen.Load()
+						if n <= cur || s.MaxBatchSeen.CompareAndSwap(cur, n) {
+							break
 						}
 					}
+					// "Advertised but malfunctioning": the capability was
+					// offered and the command is now refused anyway. RFC 3502
+					// atomicity means NOTHING may be stored.
+					if s.MultiAppendBroken.Load() {
+						if s.MultiAppendBAD.Load() {
+							send(tag + " BAD APPEND unexpected literal")
+						} else {
+							send(tag + " NO MULTIAPPEND not really supported")
+						}
+						continue
+					}
 				}
-				date := "17-Jul-2026 10:00:00 +0000"
-				if dm := regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`).
-					FindAllStringSubmatch(head, -1); len(dm) > 1 {
-					date = dm[len(dm)-1][1]
-				}
-				var body []byte
-				if len(lits) > 0 {
-					body = lits[0]
-				}
+				// The simulated store cost is PER MESSAGE, not per command:
+				// a real server storing eight messages in one MULTIAPPEND
+				// does eight messages' worth of work.
 				if d := s.AppendDelayMS.Load(); d > 0 {
-					time.Sleep(time.Duration(d) * time.Millisecond)
+					time.Sleep(time.Duration(d) * time.Duration(len(lits)) * time.Millisecond)
 				}
-				if len(s.AppendKill) > 0 && bytes.Contains(body, s.AppendKill) {
-					s.KillCount.Add(1)
-					return // content filter RSTs the line
+				// Validate the WHOLE command before storing anything: RFC
+				// 3502 forbids partial appending, so a rejection must leave
+				// the mailbox exactly as it was.
+				for _, body := range lits {
+					if len(s.AppendKill) > 0 && bytes.Contains(body, s.AppendKill) {
+						s.KillCount.Add(1)
+						return // content filter RSTs the line
+					}
 				}
-				if len(s.AppendReject) > 0 && bytes.Contains(body, s.AppendReject) {
-					send(tag + " NO APPEND failed")
+				rejected := false
+				for _, body := range lits {
+					if len(s.AppendReject) > 0 && bytes.Contains(body, s.AppendReject) {
+						rejected = true
+					}
+				}
+				if rejected {
+					send(tag + " NO APPEND failed") // atomic: nothing stored
 					continue
 				}
+				var stored []*Msg
 				acct.mu.Lock()
-				msg := f.Add(body, flags, date)
+				for i, body := range lits {
+					head := segs[0]
+					if i > 0 {
+						head = segs[i]
+					}
+					stored = append(stored, f.Add(body, appendFlags(head),
+						appendDate(head, i == 0)))
+				}
 				acct.mu.Unlock()
-				n := s.AppendCount.Add(1)
-				send(fmt.Sprintf("%s OK [APPENDUID %d %d] append done", tag, f.UIDValidity, msg.UID))
-				if v := s.DropAfterOKN.Load(); v > 0 && n == v {
+				n := s.AppendCount.Add(int64(len(lits)))
+				if v := s.DropBeforeOKBatch.Load(); v > 0 && int64(len(lits)) >= v {
+					// Stored, but the acknowledgement never arrives: the
+					// ambiguous-batch case reconciliation must resolve.
+					return
+				}
+				send(fmt.Sprintf("%s OK [APPENDUID %d %s] append done",
+					tag, f.UIDValidity, appendUIDSet(stored)))
+				if v := s.DropAfterOKN.Load(); v > 0 && n >= v && n-int64(len(lits)) < v {
 					return // ack sent, then the line dies (dup-prevention test)
 				}
 			default:
@@ -646,6 +776,59 @@ func (s *Server) client(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// appendFlags extracts the optional flag-list of one append-message.
+func appendFlags(head string) []string {
+	var flags []string
+	if mm := regexp.MustCompile(`\(([^)]*)\)`).FindStringSubmatch(head); mm != nil {
+		for _, fl := range strings.Fields(mm[1]) {
+			if !strings.EqualFold(fl, `\Recent`) {
+				flags = append(flags, fl)
+			}
+		}
+	}
+	return flags
+}
+
+// appendDate extracts the optional date-time of one append-message. On the
+// FIRST message the segment also contains the quoted mailbox name, so the
+// date is the LAST quoted string and only counts when there is more than
+// one; later segments carry the date alone.
+func appendDate(head string, first bool) string {
+	q := regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`).FindAllStringSubmatch(head, -1)
+	want := 1
+	if first {
+		want = 2 // mailbox + date
+	}
+	if len(q) >= want {
+		return q[len(q)-1][1]
+	}
+	return "17-Jul-2026 10:00:00 +0000"
+}
+
+// appendUIDSet renders the APPENDUID value. RFC 4315 is explicit that the
+// UID SET form MUST NOT be used for a single message ("a server MUST NOT
+// send a range such as 123:123"), so a one-message APPEND reports one UID —
+// which is exactly the case a client without MULTIAPPEND relies on.
+func appendUIDSet(stored []*Msg) string {
+	if len(stored) == 1 {
+		return strconv.FormatUint(uint64(stored[0].UID), 10)
+	}
+	parts := make([]string, 0, len(stored))
+	for i := 0; i < len(stored); {
+		j := i
+		for j+1 < len(stored) && stored[j+1].UID == stored[j].UID+1 {
+			j++
+		}
+		if j > i {
+			parts = append(parts, fmt.Sprintf("%d:%d", stored[i].UID, stored[j].UID))
+		} else {
+			parts = append(parts, strconv.FormatUint(uint64(stored[i].UID), 10))
+		}
+		i = j + 1
+	}
+	return strings.Join(parts, ",")
 }
 
 // unquote strips one layer of IMAP double-quoting from a mailbox argument.

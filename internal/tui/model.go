@@ -81,10 +81,18 @@ var shutdownPhases = []string{
 	"Releasing resources",
 }
 
-// popupState is a modal detail box (Enter opens, Esc/Enter/q closes).
+// popupState is a modal detail box (Enter opens, Esc/Enter closes).
+//
+// Two kinds. A STATIC popup (history event, error detail) captures its lines
+// when it opens, because the thing it describes has already happened. A LIVE
+// popup names a mailbox instead and is re-rendered from the CURRENT snapshot
+// on every frame, so the mailbox inspector keeps ticking exactly like the
+// Dashboard rather than freezing whatever was true when Enter was pressed.
 type popupState struct {
 	Title string
 	Lines []string
+	// Live names the mailbox this popup inspects; "" means static.
+	Live string
 }
 
 // Model is the Bubble Tea model. It owns only presentation state; all
@@ -119,12 +127,22 @@ type Model struct {
 	search     string
 	searchView int
 
+	// confirmQuit is the ONE quit gate. Every interactive exit path — q,
+	// Ctrl+C, Esc on the Results screen — raises this dialog instead of
+	// leaving directly, so no single keystroke can ever end a migration by
+	// accident. Esc dismisses it; it never quits anything.
+	confirmQuit bool
+
 	// completion state (Results view)
 	finished     bool       // engine done — Results is home
 	resultsShown bool       // the operator saw the Results screen
 	results      *ResultMsg // authoritative end-of-run payload
 	popup        *popupState
 	flash        string
+
+	// F9 Settings editor (nil = read-only informational mode)
+	settings *SettingsCtx
+	set      settingsState
 
 	// system telemetry (informational only)
 	mon      *sysmon.Mon
@@ -142,10 +160,15 @@ type Model struct {
 	shutHold     bool
 
 	// rolling rates (wire-based, like the classic dashboard)
-	grate     *engine.RateTracker
-	gwire     *engine.RateTracker
-	mbWire    map[int]*engine.RateTracker
-	mbPay     map[int]*engine.RateTracker
+	grate  *engine.RateTracker
+	gwire  *engine.RateTracker
+	mbWire map[int]*engine.RateTracker
+	mbPay  map[int]*engine.RateTracker
+	// Per-CONNECTION throughput for the Source/Destination panel. Each side
+	// is tracked on its own wire bytes, so the panel reports what that
+	// connection is doing right now rather than a run-wide average.
+	mbSrcWire map[int]*engine.RateTracker
+	mbDstWire map[int]*engine.RateTracker
 	lastRates [2]float64
 
 	quitting bool
@@ -165,6 +188,7 @@ func New(stats *engine.Stats, bus *engine.Bus, cancel, hardKC context.CancelFunc
 		snap: stats.Snapshot(), mon: mon,
 		grate: engine.NewRateTracker(), gwire: engine.NewRateTracker(),
 		mbWire: map[int]*engine.RateTracker{}, mbPay: map[int]*engine.RateTracker{},
+		mbSrcWire: map[int]*engine.RateTracker{}, mbDstWire: map[int]*engine.RateTracker{},
 	}
 }
 
@@ -172,6 +196,15 @@ func (m *Model) stopSysmon() {
 	if m.mon != nil {
 		m.mon.Stop()
 	}
+}
+
+// refreshDur converts a refresh-interval in milliseconds to a Duration,
+// clamped to the same floor New() enforces (F9 can change it live).
+func refreshDur(ms int) time.Duration {
+	if ms < 50 {
+		ms = 50
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // phaseCmd schedules the next shutdown-dialog phase tick.
@@ -235,7 +268,33 @@ func (m *Model) openErrorPopup(e engine.LogEntry) {
 	m.popup = &popupState{Title: "Error Detail", Lines: lines}
 }
 
+// openMailboxPopup opens the LIVE mailbox inspector. It records only which
+// mailbox to watch; every figure is rendered fresh from the current snapshot
+// on each frame (see mailboxInspector), so the screen keeps ticking with the
+// same cadence as the Dashboard for as long as it is open.
 func (m *Model) openMailboxPopup(mb engine.MBValues) {
+	m.popup = &popupState{Title: "Mailbox — " + mb.Label, Live: mb.Label}
+}
+
+// liveMailbox finds the inspected mailbox in the CURRENT snapshot. Matching
+// by label rather than by index keeps the right mailbox under inspection
+// even when the list is re-sorted or re-filtered underneath it.
+func (m *Model) liveMailbox(label string) (engine.MBValues, bool) {
+	for _, mb := range m.snap.Mailboxes {
+		if mb.Label == label {
+			return mb, true
+		}
+	}
+	return engine.MBValues{}, false
+}
+
+// mailboxInspector renders the live detail for one mailbox. Everything the
+// Dashboard knows about this mailbox, refreshed every tick.
+func (m *Model) mailboxInspector(label string) []string {
+	mb, ok := m.liveMailbox(label)
+	if !ok {
+		return []string{"", "This mailbox is no longer in the run.", ""}
+	}
 	el := "-"
 	if !mb.Start.IsZero() {
 		end := mb.End
@@ -244,27 +303,71 @@ func (m *Model) openMailboxPopup(mb engine.MBValues) {
 		}
 		el = util.FmtDHMS(end.Sub(mb.Start).Seconds())
 	}
+	speed := m.mbSpeed(mb.Index)
+	eta := "-"
+	if e, ok := mbETA(mb, speed); ok {
+		eta = util.FmtDHMS(e)
+	}
+	rate := "-"
+	if speed > 0 {
+		rate = util.FmtBytes(speed) + "/s"
+	}
+
 	lines := []string{
 		"Status      " + mb.Status,
-		fmt.Sprintf("Source      %s @ %s (%s)", mb.Label, mb.Src.Host, mb.Src.ConnState),
-		fmt.Sprintf("Destination %s @ %s (%s)", orEmpty(mb.Label2), mb.Dst.Host, mb.Dst.ConnState),
 		fmt.Sprintf("Folders     %d/%d", mb.FolderIndex, mb.FoldersTotal),
-		fmt.Sprintf("Messages    %d/%d · %s of %s", mb.MsgsDone, mb.MsgsTotal,
-			util.FmtBytes(float64(mb.BytesDone)), util.FmtBytes(float64(mb.BytesTotal))),
+		fmt.Sprintf("Messages    %d/%d  (%s)", mb.MsgsDone, mb.MsgsTotal,
+			util.Pct(mb.MsgsDone, mb.MsgsTotal)),
+		fmt.Sprintf("Progress    %s of %s", util.FmtBytes(float64(mb.BytesDone)),
+			util.FmtBytes(float64(mb.BytesTotal))),
+		fmt.Sprintf("Throughput  %s · ETA %s", rate, eta),
 		fmt.Sprintf("Adopted     %d · appended %d · pre-existing %d",
 			mb.Adopted, mb.Appended, mb.Dst.Existing),
 		fmt.Sprintf("Failed      %d · skipped %d · reconnects %d",
 			mb.FailedMsgs, mb.Skipped, mb.Src.Reconnects+mb.Dst.Reconnects),
 		"Elapsed     " + el,
+		"",
+		cCyan.Render("↓ Source"),
+		"  Host      " + mb.Src.Host,
+		"  Server    " + mb.Src.ServerLabel(),
+		"  Auth      " + orDash(mb.Src.Auth),
+		"  TLS       " + tlsLabel(mb.Src.Security),
+		"  Speed     " + m.sideSpeedText(mb.Index, false),
+		"  State     " + mb.Src.ConnState,
+		"",
+		cCyan.Render("↑ Destination"),
+		"  Host      " + mb.Dst.Host,
+		"  Server    " + mb.Dst.ServerLabel(),
+		"  Auth      " + orDash(mb.Dst.Auth),
+		"  TLS       " + tlsLabel(mb.Dst.Security),
+		"  Speed     " + m.sideSpeedText(mb.Index, true),
+		"  State     " + mb.Dst.ConnState,
+		"",
+		"MULTIAPPEND " + mb.MA.Detail(),
+	}
+	if caps := notableCaps(mb.Dst.Advertised); caps != "" {
+		lines = append(lines, wrapLines("Dst caps    ", caps, 56)...)
 	}
 	if mb.Op != "" {
-		lines = append(lines, "Operation   "+mb.Op)
+		lines = append(lines, "", "Operation   "+mb.Op)
 	}
 	if mb.Error != "" {
 		lines = append(lines, "")
 		lines = append(lines, wrapLines("Error  ", mb.Error, 56)...)
 	}
-	m.popup = &popupState{Title: "Mailbox — " + mb.Label, Lines: lines}
+	return lines
+}
+
+// mbETA estimates the remaining time for one mailbox from its own current
+// throughput. ok=false when there is nothing meaningful to estimate from.
+func mbETA(mb engine.MBValues, speed float64) (float64, bool) {
+	if speed <= 0 || mb.BytesTotal <= 0 || mb.BytesDone >= mb.BytesTotal {
+		return 0, false
+	}
+	if mb.Status != "RUNNING" && mb.Status != "RETRYING" {
+		return 0, false
+	}
+	return float64(mb.BytesTotal-mb.BytesDone) / speed, true
 }
 
 // wrapLines wraps text at width, prefixing the first line with head.
@@ -326,13 +429,22 @@ func (m *Model) sampleRates() {
 		if m.mbWire[mb.Index] == nil {
 			m.mbWire[mb.Index] = engine.NewRateTracker()
 			m.mbPay[mb.Index] = engine.NewRateTracker()
+			m.mbSrcWire[mb.Index] = engine.NewRateTracker()
+			m.mbDstWire[mb.Index] = engine.NewRateTracker()
 		}
-		w := mb.Src.RXBytes + mb.Src.TXBytes
-		if d := mb.Dst.RXBytes + mb.Dst.TXBytes; d > w {
-			w = d
+		src := mb.Src.RXBytes + mb.Src.TXBytes
+		dst := mb.Dst.RXBytes + mb.Dst.TXBytes
+		w := src
+		if dst > w {
+			w = dst
 		}
 		m.mbWire[mb.Index].Update(now, w, 0)
 		m.mbPay[mb.Index].Update(now, mb.BytesDone, mb.MsgsDone)
+		// Each connection's own total wire traffic. One figure per side: an
+		// IMAP connection both sends and receives by nature, so splitting it
+		// into TX/RX would add a column without adding an answer.
+		m.mbSrcWire[mb.Index].Update(now, src, 0)
+		m.mbDstWire[mb.Index].Update(now, dst, 0)
 	}
 	wb, _ := m.gwire.Rates()
 	pb, pm := m.grate.Rates()
@@ -356,6 +468,30 @@ func (m *Model) mbSpeed(idx int) float64 {
 		return pr
 	}
 	return wr
+}
+
+// sideSpeed is the current throughput of ONE connection, for the
+// Source/Destination panel. Returns ok=false when nothing has moved yet, so
+// the panel can show a dash rather than a misleading 0 B/s.
+func (m *Model) sideSpeed(idx int, dst bool) (float64, bool) {
+	t := m.mbSrcWire[idx]
+	if dst {
+		t = m.mbDstWire[idx]
+	}
+	if t == nil {
+		return 0, false
+	}
+	r, _ := t.Rates()
+	return r, r > 0
+}
+
+// sideSpeedText renders one connection's throughput, or "-" when nothing
+// has moved yet.
+func (m *Model) sideSpeedText(idx int, dst bool) string {
+	if v, ok := m.sideSpeed(idx, dst); ok {
+		return util.FmtBytes(v) + "/s"
+	}
+	return "-"
 }
 
 func (m *Model) eta() (float64, bool) {

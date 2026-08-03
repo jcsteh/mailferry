@@ -101,6 +101,9 @@ type DedupOptions struct {
 	Execute   bool // false = analysis only (default, a dry run)
 	TLSVerify bool
 	Timeout   float64 // seconds
+	// Auth, when non-nil, authenticates the destination with SASL bearer
+	// tokens (OAuth) instead of a password. Provider-agnostic.
+	Auth *imapx.SASLAuth
 }
 
 // subjectOf pulls a short Subject from the fetched header for the report.
@@ -225,6 +228,7 @@ func Dedup(ctx context.Context, spec config.MailboxSpec, opt DedupOptions,
 	}
 	dst := imapx.NewClient(imapx.Endpoint(spec.Dst), to, opt.TLSVerify, nil,
 		spec.Dst.Label(), func(s string) { logf("dst: " + s) })
+	dst.Auth = opt.Auth // nil = password LOGIN (unchanged default)
 	// Belt-and-suspenders for the safe-by-design dry run: in analysis mode the
 	// client is put in ReadOnly, so every mutating verb is blocked at the
 	// protocol choke point — a bug could not leak a write even in principle.

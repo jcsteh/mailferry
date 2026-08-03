@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Andy Saputra
 # Author: Andy Saputra <andy@saputra.org>
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# MailFerry v2.0.0 — reproducible release build (all six targets).
+# Reproducible release build (all six targets).
 #
 # Usage: ./build.sh [output-dir]        (default: ./dist)
 #
@@ -13,7 +13,13 @@
 # toolchain. macOS signing/notarisation happens AFTER this step - see
 # docs/RELEASING-MACOS.md.
 set -e
-VERSION=$(grep -o 'Version *= *"[^"]*"' internal/identity/identity.go | head -1 | cut -d'"' -f2)
+# The version comes from MailFerry itself, which composes it from the single
+# definition in internal/identity (Core + Stage). This script deliberately
+# does NOT parse the source or keep a copy: promoting v2.1.0-RC1 to v2.1.0 is
+# a one-line change there and nothing here needs touching.
+VERSION=$(go run ./cmd/mailferry version --bare)
+[ -n "$VERSION" ] || { echo "could not determine version" >&2; exit 1; }
+echo "MailFerry v$VERSION"
 OUT=${1:-dist}
 mkdir -p "$OUT"
 # CHANGELOG.md is embedded from the repository root by changelog_embed.go

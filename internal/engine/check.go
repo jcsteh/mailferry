@@ -42,6 +42,21 @@ func Preflight(cfg *config.Run, spec config.MailboxSpec) PreflightResult {
 		spec.Label(), nil)
 	dst := imapx.NewClient(imapx.Endpoint(spec.Dst), to, cfg.TLSVerify, nil,
 		spec.Label(), nil)
+	// OAuth-aware preflight: attach any configured SASL authenticator so
+	// `check` verifies modern-auth connectivity too. A profile error is
+	// reported like any other connection failure.
+	if a, err := saslAuthFor(cfg, spec.SrcAuth, spec.Src.User); err != nil {
+		out.Err = fmt.Errorf("source: %w", err)
+		return out
+	} else {
+		src.Auth = a
+	}
+	if a, err := saslAuthFor(cfg, spec.DstAuth, spec.Dst.User); err != nil {
+		out.Err = fmt.Errorf("destination: %w", err)
+		return out
+	} else {
+		dst.Auth = a
+	}
 	defer func() {
 		for _, c := range []*imapx.Client{src, dst} {
 			if c != nil && c.Alive() {

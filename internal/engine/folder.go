@@ -20,11 +20,13 @@ package engine
 //   - losing the DB re-enters adoption: duplicates are impossible by design
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/ajsap/mailferry/v2/internal/config"
 	"github.com/ajsap/mailferry/v2/internal/imapx"
 	"github.com/ajsap/mailferry/v2/internal/state"
 	"github.com/ajsap/mailferry/v2/internal/util"
@@ -70,6 +72,10 @@ type folderSyncer struct {
 	copied     []uint32
 	lastAppUID uint32
 	lossPhase  string // "fetch" (source) | "append" (destination)
+	// MULTIAPPEND telemetry for this folder — secondary information only.
+	// Message statistics never come from here.
+	maCommands int64
+	maMessages int64
 }
 
 func (s *folderSyncer) logf(format string, a ...any) {
@@ -369,6 +375,13 @@ func (s *folderSyncer) run() (FolderOutcome, error) {
 		s.logf("done: src=%d dst=%d synced=%d adopted=%d copied=%d skipped=%d failed=%d",
 			util.IntervalsCount(srcIV), st2["MESSAGES"], nDone, out.Adopted, out.Copied, nSkip, nFail)
 	}
+	// Secondary telemetry: how much protocol the batching actually saved.
+	// Message statistics above are unaffected by it and never derived from it.
+	if s.maCommands > 0 {
+		s.logf("MULTIAPPEND: %d message(s) uploaded in %d append command(s) "+
+			"(average %.1f per command)", s.maMessages, s.maCommands,
+			float64(s.maMessages)/float64(s.maCommands))
+	}
 	out.OK = true
 	return out, nil
 }
@@ -602,18 +615,32 @@ type failedRow struct {
 type pendAppend struct {
 	row  state.MsgRow
 	fp   string
-	pend *imapx.Pending
 	size int64
 }
 
-// transferPass streams a pipelined FETCH->APPEND window over rows.
+// pendCommand is ONE outstanding append command awaiting its tagged
+// completion — a single APPEND (one message) or a MULTIAPPEND (several).
+// The command is the unit of PROTOCOL; every message inside it stays an
+// independent unit of durable accounting, which is why msgs is a slice and
+// nothing here is ever recorded as "the batch succeeded".
+type pendCommand struct {
+	msgs  []pendAppend
+	pend  *imapx.Pending
+	multi bool
+}
+
+// transferPass streams a pipelined FETCH->APPEND window over rows. When the
+// destination advertises MULTIAPPEND (RFC 3502) and the run permits it,
+// consecutive messages are grouped into one append command; the streaming,
+// the per-message state rows and the statistics are otherwise identical.
 func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 	out *FolderOutcome) ([]failedRow, error) {
 	cfg, db, mb := s.r.Cfg, s.r.DB, s.r.MB
 	var failures []failedRow
-	var pend []pendAppend
+	var pend []pendCommand
 	var doneBatch []state.DoneTriple
 	lastFlush := time.Now()
+	policy := s.r.multiAppendPolicy()
 
 	flush := func(force bool) {
 		if len(doneBatch) > 0 && (force || len(doneBatch) >= 200 ||
@@ -623,19 +650,9 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 			lastFlush = time.Now()
 		}
 	}
-	settleOne := func() error {
-		pa := pend[0]
-		pend = pend[1:]
-		res, err := pa.pend.Wait()
-		s.dst.AppendDone()
-		if err != nil {
-			if imapx.IsConnLost(err) {
-				return err
-			}
-			failures = append(failures, failedRow{pa.row, err.Error()})
-			return nil
-		}
-		duid := imapx.AppendUIDOf(res)
+	// recordDone books ONE message as copied. Batching never changes it:
+	// one message, one done row, one MsgsDone, its own BytesDone.
+	recordDone := func(pa pendAppend, duid int64) {
 		doneBatch = append(doneBatch, state.DoneTriple{SrcUID: pa.row.SrcUID,
 			DstUID: duid, FP: pa.fp})
 		s.copied = append(s.copied, pa.row.SrcUID)
@@ -645,18 +662,72 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 			m.Appended++
 		})
 		out.Copied++
+	}
+	settleOne := func() error {
+		pc := pend[0]
+		pend = pend[1:]
+		res, err := pc.pend.Wait()
+		s.dst.AppendDone()
+		if err != nil {
+			if imapx.IsConnLost(err) {
+				return err
+			}
+			// A tagged NO/BAD. RFC 3502 makes MULTIAPPEND atomic — "no
+			// partial appending is permitted" — so on a rejected batch
+			// NOTHING was stored and every member is safely retryable. Retry
+			// them one at a time so the actual offender is identified rather
+			// than blaming its innocent neighbours.
+			if pc.multi {
+				s.demoteMultiAppend(err, len(pc.msgs))
+			}
+			for _, pa := range pc.msgs {
+				failures = append(failures, failedRow{pa.row, err.Error()})
+			}
+			if pc.multi && commandWasNotUnderstood(err) {
+				// The destination advertised MULTIAPPEND and then failed to
+				// parse it. The literals we streamed may have been consumed
+				// as commands, so this connection can no longer be trusted:
+				// drop it, reconnect, and let per-message reconciliation
+				// establish the truth before anything is appended again.
+				s.dst.Abort(&imapx.ConnLost{Msg: "destination rejected MULTIAPPEND as malformed"})
+				return &imapx.ConnLost{Msg: "destination advertised MULTIAPPEND but could not parse it"}
+			}
+			return nil
+		}
+		if !pc.multi {
+			recordDone(pc.msgs[0], imapx.AppendUIDOf(res))
+			return nil
+		}
+		// RFC 4315: a MULTIAPPEND completion carries a UID SET, in
+		// transmission order. If it cannot be mapped one-to-one, record the
+		// messages without destination UIDs rather than guessing — exactly
+		// what MailFerry already does for servers without UIDPLUS.
+		uids := imapx.AppendUIDsOf(res, len(pc.msgs))
+		for i, pa := range pc.msgs {
+			duid := int64(0)
+			if uids != nil {
+				duid = uids[i]
+			}
+			recordDone(pa, duid)
+		}
+		s.maCommands++
+		s.maMessages += int64(len(pc.msgs))
+		s.r.noteBatch(len(pc.msgs))
 		return nil
 	}
 
-	type fetchItem struct {
-		row state.MsgRow
-		bh  *imapx.BodyHandle
-	}
 	var fetchQ []fetchItem
 	next := 0
 	var newlyWindowed []uint32
+	// An explicit batch size needs at least that many bodies in flight, or
+	// the destination command would sit open waiting for fetches that were
+	// never issued.
+	fetchWindow := cfg.FetchWindow
+	if policy.Enabled && !policy.Auto && policy.MaxCount > fetchWindow {
+		fetchWindow = policy.MaxCount
+	}
 	startMore := func() error {
-		for next < len(rows) && len(fetchQ) < cfg.FetchWindow {
+		for next < len(rows) && len(fetchQ) < fetchWindow {
 			r := rows[next]
 			next++
 			bh, err := s.src.BodyFetch(r.SrcUID)
@@ -674,6 +745,28 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 		return failures, err
 	}
 
+	// settleSent drains the append commands ALREADY on the wire.
+	//
+	// Cancellation must not walk away from work the destination has already
+	// been asked to do. If MailFerry stops reading, those messages stay
+	// "inflight" and their true outcome is unknown until the next run
+	// reconciles — and the destination may still be committing them while
+	// that reconciliation scans, which is exactly how a cancelled run can
+	// end up copying a message that did in fact arrive.
+	//
+	// Waiting is cheap and bounded: the append window already caps how many
+	// messages may be unsettled, so this costs at most one window's worth of
+	// acknowledgements. A connection that dies while draining leaves the
+	// remaining rows inflight, which is the ordinary ambiguous case that
+	// fingerprint reconciliation is built for.
+	settleSent := func() {
+		for len(pend) > 0 {
+			if err := settleOne(); err != nil {
+				return
+			}
+		}
+	}
+
 	if err := startMore(); err != nil {
 		return fail(err)
 	}
@@ -684,75 +777,146 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 			newlyWindowed = nil
 		}
 		if s.stopped() {
+			settleSent()
 			flush(true)
 			return failures, errStopRun
 		}
 		for s.r.Bus != nil && s.r.Bus.IsPaused() && !s.stopped() {
 			time.Sleep(300 * time.Millisecond) // paused: finish nothing new
 		}
-		item := fetchQ[0]
-		fetchQ = fetchQ[1:]
-		if err := startMore(); err != nil {
-			return fail(err)
+
+		// ---- decide this iteration's append command -----------------------
+		// planned > 1 opens a MULTIAPPEND; anything else is the unchanged
+		// single-message path, so a destination without the capability, a
+		// dry run, or a batch of one behaves exactly as it always has.
+		planned := 1
+		var ma *imapx.MultiAppend
+		if s.useMultiAppend(policy) {
+			if n := planBatch(fetchQ, policy); n > 1 {
+				m, err := s.dst.MultiAppendBegin(s.plan.DstWire)
+				if err == nil {
+					ma, planned = m, n
+				}
+			}
 		}
-		s.lossPhase = "fetch" // a loss here blames the source
-		size, err := item.bh.WaitSize(time.Duration(cfg.Timeout * float64(time.Second)))
-		if err != nil {
-			if imapx.IsConnLost(err) {
+		var members []pendAppend
+
+		for k := 0; k < planned && len(fetchQ) > 0; k++ {
+			// Cancellation closes the batch at a message boundary: a
+			// MULTIAPPEND with fewer messages than planned is perfectly
+			// valid, so a stop request never abandons a half-written command.
+			if k > 0 && s.stopped() {
+				break
+			}
+			item := fetchQ[0]
+			fetchQ = fetchQ[1:]
+			if err := startMore(); err != nil {
 				return fail(err)
 			}
-			failures = append(failures, failedRow{item.row, "fetch failed: " + err.Error()})
-			continue
-		}
-		s.op(fmt.Sprintf("MIGRATE uid %d (%s)", item.row.SrcUID, util.FmtBytes(float64(size))))
-		flags := cleanFlags(item.row.Flags, stripKeywords)
-		s.lastAppUID = item.row.SrcUID // poison attribution
-		s.lossPhase = "append"         // a loss here blames the message
-		sink, err := s.dst.AppendBegin(s.plan.DstWire, flags, item.row.InternalDate, size)
-		if err != nil {
-			drainBody(item.bh)
-			// --dry-run: the APPEND was refused at the choke point by design.
-			// This is the EXPECTED outcome — the message WOULD be migrated — so
-			// count it as such and move on. Nothing is written to the server,
-			// and (dry runs force an ephemeral State DB) nothing is persisted.
-			if imapx.IsDryRunBlocked(err) {
-				out.Copied++
-				mb.Add(func(m *MBValues) {
-					m.MsgsDone++
-					m.Planned++ // dry run: WOULD be copied - keeps counters reconciled
-					m.BytesDone += size
-				})
+			s.lossPhase = "fetch" // a loss here blames the source
+			size, err := item.bh.WaitSize(time.Duration(cfg.Timeout * float64(time.Second)))
+			if err != nil {
+				if imapx.IsConnLost(err) {
+					return fail(err)
+				}
+				failures = append(failures, failedRow{item.row, "fetch failed: " + err.Error()})
 				continue
 			}
-			return fail(err)
+			s.op(fmt.Sprintf("MIGRATE uid %d (%s)", item.row.SrcUID, util.FmtBytes(float64(size))))
+			flags := cleanFlags(item.row.Flags, stripKeywords)
+			s.lastAppUID = item.row.SrcUID // poison attribution
+			s.lossPhase = "append"         // a loss here blames the message
+
+			var sink *imapx.AppendSink
+			if ma != nil {
+				if aerr := ma.AddBegin(flags, item.row.InternalDate, size); aerr != nil {
+					drainBody(item.bh)
+					return fail(aerr)
+				}
+			} else {
+				sink, err = s.dst.AppendBegin(s.plan.DstWire, flags, item.row.InternalDate, size)
+				if err != nil {
+					drainBody(item.bh)
+					// --dry-run: the APPEND was refused at the choke point by
+					// design. This is the EXPECTED outcome — the message WOULD
+					// be migrated — so count it as such and move on. Nothing is
+					// written to the server, and (dry runs force an ephemeral
+					// State DB) nothing is persisted.
+					if imapx.IsDryRunBlocked(err) {
+						out.Copied++
+						mb.Add(func(m *MBValues) {
+							m.MsgsDone++
+							m.Planned++ // dry run: WOULD be copied - keeps counters reconciled
+							m.BytesDone += size
+						})
+						continue
+					}
+					return fail(err)
+				}
+			}
+
+			var sniffer util.HeaderSniffer
+			chunks, errs := item.bh.Chunks()
+			write := func(chunk []byte) error {
+				if ma != nil {
+					return ma.Write(chunk)
+				}
+				return sink.Write(chunk)
+			}
+		stream:
+			for {
+				select {
+				case chunk, ok := <-chunks:
+					if !ok {
+						break stream
+					}
+					sniffer.Feed(chunk)
+					if werr := write(chunk); werr != nil {
+						return fail(werr)
+					}
+				case rerr := <-errs:
+					// The literal was already declared to the destination and
+					// cannot now be completed. The command is unfinishable, so
+					// the connection goes; the per-message intent rows and
+					// fingerprint reconciliation resolve what landed.
+					if ma != nil {
+						s.dst.Abort(&imapx.ConnLost{Msg: "source body stream failed mid-append"})
+					}
+					return fail(rerr)
+				}
+			}
+			fp := item.row.FP
+			if fp == "" {
+				fp = sniffer.Fingerprint(size)
+			}
+			if ma != nil {
+				members = append(members, pendAppend{item.row, fp, size})
+				continue
+			}
+			pending, ferr := sink.Finish()
+			if ferr != nil {
+				return fail(ferr)
+			}
+			pend = append(pend, pendCommand{msgs: []pendAppend{{item.row, fp, size}},
+				pend: pending})
 		}
-		var sniffer util.HeaderSniffer
-		chunks, errs := item.bh.Chunks()
-	stream:
-		for {
-			select {
-			case chunk, ok := <-chunks:
-				if !ok {
-					break stream
-				}
-				sniffer.Feed(chunk)
-				if werr := sink.Write(chunk); werr != nil {
-					return fail(werr)
-				}
-			case rerr := <-errs:
-				return fail(rerr)
+
+		if ma != nil {
+			pending, ferr := ma.Finish()
+			if ferr != nil {
+				return fail(ferr)
+			}
+			if pending != nil { // nil == the batch ended up empty: nothing was sent
+				pend = append(pend, pendCommand{msgs: members, pend: pending, multi: true})
 			}
 		}
-		pending, err := sink.Finish()
-		if err != nil {
-			return fail(err)
-		}
-		fp := item.row.FP
-		if fp == "" {
-			fp = sniffer.Fingerprint(size)
-		}
-		pend = append(pend, pendAppend{item.row, fp, pending, size})
-		for len(pend) >= cfg.AppendWindow {
+
+		// The append window has always bounded in-flight MESSAGES, and
+		// batching must not quietly redefine it: eight messages in one
+		// command and eight separate commands leave the same amount of work
+		// unsettled, so cancellation stays as responsive as it ever was and
+		// the destination is asked to hold no more than before.
+		for pendingMsgs(pend) >= cfg.AppendWindow {
 			if err := settleOne(); err != nil {
 				return fail(err)
 			}
@@ -766,6 +930,93 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 	}
 	flush(true)
 	return failures, nil
+}
+
+// useMultiAppend reports whether THIS pass may batch: the run permits it,
+// the destination advertises the capability, and it has not been demoted
+// after a malfunction on this mailbox.
+func (s *folderSyncer) useMultiAppend(p config.MultiAppendPolicy) bool {
+	return p.Enabled && p.MaxCount > 1 && !s.r.maDemoted.Load() &&
+		s.dst != nil && s.dst.SupportsMultiAppend()
+}
+
+// planBatch decides how many of the queued messages may share ONE
+// MULTIAPPEND command, applying the documented Auto limits in order. It uses
+// the RFC822.SIZE recorded during the source scan for planning only — every
+// literal is still declared with the exact size the source FETCH reports, so
+// a size that turns out to differ costs a slightly off budget and nothing
+// else.
+func planBatch(q []fetchItem, p config.MultiAppendPolicy) int {
+	if len(q) < 2 {
+		return 1
+	}
+	// A large message is uploaded alone: it must not drag its neighbours
+	// into an atomic all-or-nothing command.
+	if q[0].row.Size >= p.SoloBytes {
+		return 1
+	}
+	n, total := 0, int64(0)
+	for _, it := range q {
+		if n >= p.MaxCount {
+			break
+		}
+		if it.row.Size >= p.SoloBytes {
+			break // the next message goes alone, in its own iteration
+		}
+		if n > 0 && total+it.row.Size > p.MaxBytes {
+			break
+		}
+		total += it.row.Size
+		n++
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// demoteMultiAppend records a rejected batch and, on a second rejection for
+// this mailbox, stops using MULTIAPPEND for the rest of the run. Falling
+// back is always safe: RFC 3502 guarantees a rejected batch appended
+// nothing, so no message is ever uploaded twice by the demotion itself.
+func (s *folderSyncer) demoteMultiAppend(err error, n int) {
+	if s.r.maRejects.Add(1) >= 2 || commandWasNotUnderstood(err) {
+		if s.r.maDemoted.CompareAndSwap(false, true) {
+			s.r.noteMADemoted()
+			s.logf("destination rejected a MULTIAPPEND batch (%d message(s)): %v — "+
+				"continuing with one append per message for the rest of this mailbox "+
+				"(nothing was appended by the rejected batch)", n, err)
+			s.hist("MULTIAPPEND disabled", "WARN",
+				"destination rejected batched appends — using single appends")
+		}
+		return
+	}
+	s.logf("destination rejected a MULTIAPPEND batch (%d message(s)): %v — "+
+		"retrying those messages individually to identify the cause", n, err)
+}
+
+// commandWasNotUnderstood reports a tagged BAD: the server did not merely
+// refuse the request, it failed to PARSE it. That is the "advertised but
+// malfunctioning" case, and it is treated far more carefully than a NO.
+func commandWasNotUnderstood(err error) bool {
+	var ce *imapx.CommandErr
+	return errors.As(err, &ce) && ce.Status == "BAD"
+}
+
+// fetchItem is one in-flight source body fetch awaiting its turn.
+type fetchItem struct {
+	row state.MsgRow
+	bh  *imapx.BodyHandle
+}
+
+// pendingMsgs counts unsettled MESSAGES across the outstanding append
+// commands (a MULTIAPPEND contributes all of its members).
+func pendingMsgs(pend []pendCommand) int {
+	n := 0
+	for _, pc := range pend {
+		n += len(pc.msgs)
+	}
+	return n
 }
 
 func drainBody(bh *imapx.BodyHandle) {

@@ -38,6 +38,11 @@ func (m *Model) View() string {
 	if m.shuttingDown {
 		return m.shutdownView(w, h)
 	}
+	// The quit gate outranks every other modal: once it is up, nothing else
+	// may take the screen or the keyboard.
+	if m.confirmQuit {
+		return m.confirmQuitView(w, h)
+	}
 	if m.popup != nil {
 		return m.popupBox(w, h)
 	}
@@ -115,11 +120,11 @@ func (m *Model) footer(w int) string {
 	}
 	hint := ""
 	if m.active == vResults {
-		hint = "⏎ Mailboxes   F1–F10 Views   F6 Failed msgs   F8 Logs   S Reports   Q/Esc Quit"
+		hint = "⏎/Esc Mailboxes   F1–F10 Views   F6 Failed msgs   F8 Logs   S Reports   q Quit"
 	} else {
 		hint = viewFooters[m.active]
 		if m.finished {
-			hint = "Esc/q Results   " + hint
+			hint = "Esc Results   " + hint
 		}
 	}
 	if m.flash != "" {
@@ -130,16 +135,16 @@ func (m *Model) footer(w int) string {
 }
 
 var viewFooters = [numViews]string{
-	"F2–F10 Views   1–0 aliases   p Pause   Space Freeze   R Retry failed   u Reload CSV   ^C Quit",
-	"↑↓/k j Select   / Search   F1 Dashboard   ^C Quit",
-	"↑↓/k j Select   ⏎ Details   r Retry   s Sort   f Filter   / Search   ^C Quit",
-	"F1 Dashboard   ^C Quit",
-	"↑↓/k j Navigate   ⏎ Details   / Search   End/F Follow   Esc/q Back   ^C Quit",
-	"↑↓/k j Select   ⏎ Details   / Search   ^C Quit",
-	"Space Freeze   ^L Redraw   ^C Quit",
-	"↑↓/k j · PgUp/PgDn · Home/End Scroll   F Follow   / Search   Mouse wheel   ^C Quit",
-	"p Pause/Resume   ^C Quit",
-	"↑↓ Scroll   Esc/q Back   ^C Quit",
+	"F2–F10 Views   1–0 aliases   p Pause   Space Freeze   R Retry failed   u Reload CSV   ^C/q Quit",
+	"↑↓/k j Select   / Search   F1 Dashboard   ^C/q Quit",
+	"↑↓/k j Select   ⏎ Details   r Retry   s Sort   f Filter   / Search   ^C/q Quit",
+	"F1 Dashboard   ^C/q Quit",
+	"↑↓/k j Navigate   ⏎ Details   / Search   End/F Follow   Esc Back   ^C/q Quit",
+	"↑↓/k j Select   ⏎ Details   / Search   ^C/q Quit",
+	"Space Freeze   ^L Redraw   ^C/q Quit",
+	"↑↓/k j · PgUp/PgDn · Home/End Scroll   F Follow   / Search   Mouse wheel   ^C/q Quit",
+	"↑↓/k j Select   ⏎/Space Edit   +/- Step   S Save   Esc Discard   ^C/q Quit",
+	"↑↓ Scroll   Esc Back   ^C/q Quit",
 }
 
 func (m *Model) body(w, h int) string {
@@ -172,47 +177,435 @@ func (m *Model) body(w, h int) string {
 
 // ------------------------------------------------------------ dashboard --
 
+// runFinishedAt is the ONE authoritative completion instant. It comes from
+// the engine's RunResult — the same value the reports, the results CSV and
+// the Results screen use. The Dashboard never stamps a time of its own, so
+// there is exactly one completion time anywhere in MailFerry.
+func (m *Model) runFinishedAt() (time.Time, bool) {
+	if m.results != nil && !m.results.Res.FinishedAt.IsZero() {
+		return m.results.Res.FinishedAt, true
+	}
+	return time.Time{}, false
+}
+
+// runElapsed is the run's duration: live while migrating, and FROZEN at the
+// authoritative completion instant once the run is over. A Runtime that
+// keeps counting after a migration has finished is simply wrong — it is no
+// longer measuring anything.
+func (m *Model) runElapsed() float64 {
+	if fin, ok := m.runFinishedAt(); ok {
+		// A completion instant that precedes the start means the clock moved
+		// under us (NTP step, a resumed laptop). Showing 00:00:00 for a run
+		// that plainly took time would be worse than the live figure, so
+		// fall through rather than report an impossibility.
+		if d := fin.Sub(m.snap.BatchStart).Seconds(); d >= 0 {
+			return d
+		}
+	}
+	return time.Since(m.snap.BatchStart).Seconds()
+}
+
+// dashRow renders one "Label   value" pair in the Dashboard's key/value
+// style: no colons, aligned label column, value clipped to the cell.
+func dashRow(label, value string, cell int) string {
+	const labelW = 14
+	if cell <= labelW+2 {
+		return clip(label+" "+value, cell)
+	}
+	return fmt.Sprintf("%-*s%s", labelW, label, clip(value, cell-labelW))
+}
+
 func (m *Model) dashboardView(w, h int) string {
 	agg := m.snap.Agg()
 	br, mr := m.displayRates()
 	var b strings.Builder
-	kv := func(k, v string) string { return fmt.Sprintf("%-14s: %s", k, v) }
-	left := []string{
-		kv("CSV File", m.snap.CSVFile),
-		kv("State Database", m.snap.DBPath),
-		kv("Mode", m.snap.Mode),
-		kv("Workers", fmt.Sprintf("%d/%d", agg.Counts["RUNNING"]+agg.Counts["RETRYING"], m.snap.Workers)),
-		kv("Runtime", util.FmtDHMS(time.Since(m.snap.BatchStart).Seconds())),
+
+	type pair struct{ k, v string }
+	left := []pair{
+		{"CSV File", m.snap.CSVFile},
+		{"State DB", m.snap.DBPath},
+		{"Mode", m.snap.Mode},
+		{"Workers", fmt.Sprintf("%d / %d",
+			agg.Counts["RUNNING"]+agg.Counts["RETRYING"], m.snap.Workers)},
+		{"Runtime", util.FmtDHMS(m.runElapsed())},
 	}
+	// Once the run is over, the Dashboard says so and shows WHEN — from the
+	// authoritative FinishedAt, formatted by the same locale-aware helper the
+	// Results screen and the reports use.
+	if fin, ok := m.runFinishedAt(); ok {
+		left = append(left, pair{m.stampLabel(), util.FmtStamp(fin)})
+	}
+
 	eta := "-"
 	if e, ok := m.eta(); ok {
 		eta = util.FmtDHMS(e)
 	}
-	right := []string{
-		fmt.Sprintf("%-12s: %s / %s", "Wire RX/TX", util.FmtBytes(float64(agg.WireRX)), util.FmtBytes(float64(agg.WireTX))),
-		fmt.Sprintf("%-12s: %s/s (%.1f msg/s)", "Rate", util.FmtBytes(br), mr),
-		fmt.Sprintf("%-12s: %s", "Batch ETA", eta),
-		fmt.Sprintf("%-12s: %s", "Data", util.FmtBytes(float64(agg.BytesDone))+"/"+util.FmtBytes(float64(agg.BytesTotal))),
-		fmt.Sprintf("%-12s: %d", "Cluster", len(m.bus.ClusterSnapshot())),
+	right := []pair{
+		// Cumulative traffic for the WHOLE migration. Per-connection
+		// throughput lives in the Source/Destination panel below; these two
+		// answer different questions and must not be confused.
+		{"Sent/Rcvd", util.FmtBytes(float64(agg.WireTX)) + " / " + util.FmtBytes(float64(agg.WireRX))},
+		// Byte rate and message rate are two equally useful measurements —
+		// parenthesising the second made it look like an aside.
+		{"Rate", fmt.Sprintf("%s/s · %.1f msg/s", util.FmtBytes(br), mr)},
+		{"ETA", eta},
+		// Payload bytes confirmed migrated vs total planned for the run —
+		// completed versus total, hence "Progress". Distinct from Sent/Rcvd,
+		// which is wire traffic.
+		{"Progress", util.FmtBytes(float64(agg.BytesDone)) + " / " + util.FmtBytes(float64(agg.BytesTotal))},
+		{"Cluster", fmt.Sprint(len(m.bus.ClusterSnapshot()))},
+		// MULTIAPPEND is transport tuning, so it belongs in the
+		// run-information block — NOT in the Mode line, which is reserved
+		// for things that change what a run does.
+		{"MULTIAPPEND", m.snap.MultiAppend().Compact()},
 	}
-	lw := w - 40
-	if lw < 30 {
-		lw = 30
+
+	// Two balanced columns when there is room; one stacked column when there
+	// is not. Splitting the width evenly is what stops the left half sitting
+	// half-empty while the right half is squeezed.
+	cell, gap := (w-3)/2, 3
+	twoCol := w >= 92
+	if !twoCol {
+		cell, gap = w, 0
 	}
-	for i := 0; i < 5; i++ {
-		l, r := "", ""
-		if i < len(left) {
-			l = left[i]
+	rows := len(left)
+	if len(right) > rows {
+		rows = len(right)
+	}
+	head := 0
+	if twoCol {
+		for i := 0; i < rows; i++ {
+			l, r := "", ""
+			if i < len(left) {
+				l = dashRow(left[i].k, left[i].v, cell)
+			}
+			if i < len(right) {
+				r = dashRow(right[i].k, right[i].v, cell)
+			}
+			b.WriteString(padTo(l, cell+gap) + r + "\n")
+			head++
 		}
-		if i < len(right) {
-			r = right[i]
+	} else {
+		for _, p := range append(append([]pair{}, left...), right...) {
+			b.WriteString(dashRow(p.k, p.v, cell) + "\n")
+			head++
 		}
-		b.WriteString(fmt.Sprintf("%-*s   %s\n", lw, clip(l, lw), r))
+	}
+
+	// Connection panel: what MailFerry actually learned about the two servers
+	// it is talking to. On a short terminal it yields to the mailbox list —
+	// the list is the primary content, and the same detail is one keypress
+	// away in the F3 inspector.
+	conn := m.connectionPanel(cell, gap, twoCol)
+	const minTableRows = 6
+	if h-head-len(conn)-2 < minTableRows {
+		conn = nil
+	}
+	for _, l := range conn {
+		b.WriteString(clip(l, w) + "\n")
 	}
 	b.WriteString(strings.Repeat("─", w) + "\n")
-	b.WriteString(m.mailboxTable(w, h-7, true))
+	// The table gets whatever the header block did not use. Derived rather
+	// than hard-coded so adding a row here can never silently push the
+	// mailbox table off the bottom of the screen.
+	b.WriteString(m.mailboxTable(w, h-head-len(conn)-2, true))
 	b.WriteString(m.aggFooter(w))
 	return b.String()
+}
+
+// sideSummary aggregates what is known about every LIVE connection on one
+// side of the run. The panel renders from this rather than from any single
+// mailbox, because an MSP run migrating from three different platforms at
+// once has no "representative" mailbox — showing the first one's details
+// would simply be untrue of the run.
+type sideSummary struct {
+	count     int
+	hosts     map[string]bool
+	labels    map[string]bool // full ServerLabel()s (name + version)
+	platforms map[string]int  // identified platform -> mailbox count
+	auths     map[string]bool
+	tls       map[string]bool
+	speed     float64 // sum of current per-connection throughput
+	speedOK   bool
+}
+
+// summariseSide collects one side's connection evidence across the run.
+// Aggregation is by IDENTIFIED PLATFORM, never by hostname — two Dovecot
+// servers on different hosts are one platform, and an unidentified server
+// counts as Unknown rather than being guessed at.
+func (m *Model) summariseSide(dst bool) sideSummary {
+	s := sideSummary{hosts: map[string]bool{}, labels: map[string]bool{},
+		platforms: map[string]int{}, auths: map[string]bool{}, tls: map[string]bool{}}
+	for _, mb := range m.snap.Mailboxes {
+		side := mb.Src
+		if dst {
+			side = mb.Dst
+		}
+		// Only connections that actually happened contribute. A queued
+		// mailbox has no evidence yet, and counting it would report
+		// "Unknown" for servers MailFerry simply has not spoken to.
+		if len(side.Caps) == 0 {
+			continue
+		}
+		s.count++
+		if side.Host != "" {
+			s.hosts[side.Host] = true
+		}
+		name := side.Server
+		if name == "" {
+			name = "Unknown"
+		}
+		s.platforms[name]++
+		s.labels[side.ServerLabel()] = true
+		if side.Auth != "" {
+			s.auths[side.Auth] = true
+		}
+		if t := tlsLabel(side.Security); t != "-" {
+			s.tls[t] = true
+		}
+		if v, ok := m.sideSpeed(mb.Index, dst); ok {
+			s.speed += v
+			s.speedOK = true
+		}
+	}
+	return s
+}
+
+// hostCell names the side's host, or counts them when several share the run.
+func (s sideSummary) hostCell() string {
+	if len(s.hosts) == 1 {
+		for h := range s.hosts {
+			return h
+		}
+	}
+	if len(s.hosts) == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d hosts", len(s.hosts))
+}
+
+// serverCell names the side's platform: with the version when every
+// connection reported the same one, name-only when versions differ.
+func (s sideSummary) serverCell() string {
+	if len(s.labels) == 1 {
+		for l := range s.labels {
+			return l
+		}
+	}
+	if len(s.platforms) == 1 {
+		for p := range s.platforms {
+			return p
+		}
+	}
+	return "-"
+}
+
+func (s sideSummary) speedCell() string {
+	if !s.speedOK {
+		return "-"
+	}
+	return util.FmtBytes(s.speed) + "/s"
+}
+
+// joinedOrMixed renders a small set of values ("OAuth (Microsoft) ·
+// Password"), or "mixed" when listing them would not fit a cell.
+func joinedOrMixed(set map[string]bool) string {
+	if len(set) == 0 {
+		return "-"
+	}
+	vals := make([]string, 0, len(set))
+	for v := range set {
+		vals = append(vals, v)
+	}
+	sort.Strings(vals)
+	if len(vals) > 2 {
+		return "mixed"
+	}
+	return strings.Join(vals, " · ")
+}
+
+// connectionPanel renders the Source/Destination block. Everything in it was
+// learned from the live connections — MailFerry never guesses a server from
+// a hostname, and prints "Unknown" rather than inventing an answer.
+//
+// Two presentations, chosen by what is true of the run:
+//   - every connected mailbox on both sides uses ONE identified platform per
+//     side → the detailed per-side panel (even across several hosts);
+//   - different platforms participate in the same run → an aggregated
+//     platform count per side, because no single pair represents the run.
+//
+// The F3 inspector remains authoritative for any individual mailbox.
+func (m *Model) connectionPanel(cell, gap int, twoCol bool) []string {
+	src, dst := m.summariseSide(false), m.summariseSide(true)
+	if src.count == 0 && dst.count == 0 {
+		return nil
+	}
+	if len(src.platforms) > 1 || len(dst.platforms) > 1 {
+		return m.aggregatedPanel(src, dst, cell, gap, twoCol)
+	}
+
+	// Detailed: one platform per side. Speed is the summed current
+	// throughput of that side's live connections — for the common single
+	// pair it is simply that connection's rate. The panel deliberately does
+	// not repeat the run's cumulative traffic (the Sent/Rcvd row's job),
+	// and shows one figure per side: every IMAP connection both sends and
+	// receives by nature, so a TX/RX split would add a column without
+	// adding an answer.
+	fields := func(s sideSummary) []string {
+		return []string{
+			dashRow("  Host", s.hostCell(), cell),
+			dashRow("  Server", s.serverCell(), cell),
+			dashRow("  Auth", joinedOrMixed(s.auths), cell),
+			dashRow("  TLS", joinedOrMixed(s.tls), cell),
+			dashRow("  Speed", s.speedCell(), cell),
+		}
+	}
+	srcRows, dstRows := fields(src), fields(dst)
+
+	out := []string{""}
+	if twoCol {
+		out = append(out, padTo(cCyan.Render("↓ Source"), cell+gap)+
+			cCyan.Render("↑ Destination"))
+		for i := range srcRows {
+			out = append(out, padTo(srcRows[i], cell+gap)+dstRows[i])
+		}
+		return out
+	}
+	// Narrow: one condensed line per side; the full detail is a keypress
+	// away in the F3 inspector.
+	condensed := func(s sideSummary) string {
+		parts := []string{s.hostCell(), s.serverCell()}
+		if a := joinedOrMixed(s.auths); a != "-" {
+			parts = append(parts, a)
+		}
+		if t := joinedOrMixed(s.tls); t != "-" {
+			parts = append(parts, "TLS "+t)
+		}
+		if s.speedOK {
+			parts = append(parts, s.speedCell())
+		}
+		return strings.Join(parts, " · ")
+	}
+	out = append(out,
+		cCyan.Render("↓ Source")+"       "+clip(condensed(src), cell-15),
+		cCyan.Render("↑ Destination")+"  "+clip(condensed(dst), cell-15))
+	return out
+}
+
+// aggregatedPanel is the heterogeneous-run presentation: how many mailboxes
+// are talking to each identified platform, per side. Counts aggregate by
+// platform, never by hostname, so twelve Exchange Online mailboxes across
+// four tenants read as one line.
+func (m *Model) aggregatedPanel(src, dst sideSummary, cell, gap int, twoCol bool) []string {
+	srcRows := platformRows(src.platforms, cell)
+	dstRows := platformRows(dst.platforms, cell)
+	out := []string{""}
+	if twoCol {
+		out = append(out, padTo(cCyan.Render("↓ Sources"), cell+gap)+
+			cCyan.Render("↑ Destinations"))
+		n := len(srcRows)
+		if len(dstRows) > n {
+			n = len(dstRows)
+		}
+		for i := 0; i < n; i++ {
+			l, r := "", ""
+			if i < len(srcRows) {
+				l = srcRows[i]
+			}
+			if i < len(dstRows) {
+				r = dstRows[i]
+			}
+			out = append(out, padTo(l, cell+gap)+r)
+		}
+		return out
+	}
+	out = append(out,
+		cCyan.Render("↓ Sources")+"      "+clip(inlinePlatforms(src.platforms), cell-15),
+		cCyan.Render("↑ Destinations")+" "+clip(inlinePlatforms(dst.platforms), cell-15))
+	return out
+}
+
+// platformRows renders one side's platform counts, largest first, name as
+// the tie-break so the list never reshuffles between refreshes.
+func platformRows(platforms map[string]int, cell int) []string {
+	list := sortedPlatforms(platforms)
+	const maxRows = 6
+	var out []string
+	for i, p := range list {
+		if i == maxRows-1 && len(list) > maxRows {
+			rest := 0
+			for _, q := range list[i:] {
+				rest += q.n
+			}
+			out = append(out, clip(fmt.Sprintf("  %-18s %3d", "(others)", rest), cell))
+			break
+		}
+		out = append(out, clip(fmt.Sprintf("  %-18s %3d", clip(p.name, 18), p.n), cell))
+	}
+	return out
+}
+
+// inlinePlatforms is the narrow-terminal form: "Exchange Online 12 · Dovecot 8".
+func inlinePlatforms(platforms map[string]int) string {
+	var parts []string
+	for _, p := range sortedPlatforms(platforms) {
+		parts = append(parts, fmt.Sprintf("%s %d", p.name, p.n))
+	}
+	return strings.Join(parts, " · ")
+}
+
+type platformCount struct {
+	name string
+	n    int
+}
+
+func sortedPlatforms(platforms map[string]int) []platformCount {
+	list := make([]platformCount, 0, len(platforms))
+	for name, n := range platforms {
+		list = append(list, platformCount{name, n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].name < list[j].name
+	})
+	return list
+}
+
+// padTo right-pads s to width, measuring the rendered width so styled text
+// lines up with plain text.
+func padTo(s string, width int) string {
+	if n := width - lipgloss.Width(s); n > 0 {
+		return s + strings.Repeat(" ", n)
+	}
+	return s
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// tlsLabel renders the negotiated transport under a "TLS" heading, so the
+// value carries the version rather than repeating the word: "1.3", or
+// "1.2 (STARTTLS)" when TLS was reached by upgrading in band. A plaintext
+// connection says so plainly — that is not a detail to soften.
+func tlsLabel(security string) string {
+	switch {
+	case security == "" || security == "-":
+		return "-"
+	case security == "none":
+		return "none (plaintext)"
+	case strings.HasPrefix(security, "STARTTLS → TLS "):
+		return strings.TrimPrefix(security, "STARTTLS → TLS ") + " (STARTTLS)"
+	case strings.HasPrefix(security, "TLS "):
+		return strings.TrimPrefix(security, "TLS ")
+	default:
+		return security
+	}
 }
 
 func (m *Model) mailboxTable(w, h int, detail bool) string {
@@ -291,7 +684,7 @@ func (m *Model) aggFooter(w int) string {
 	if c["REMOTE"] > 0 {
 		frag += "   " + cCyan.Render(fmt.Sprintf("%d on other workers", c["REMOTE"]))
 	}
-	line2 := fmt.Sprintf("Msgs %d/%d (%s)   Data %s   Rate %s/s (%.1f msg/s)   New %d   Adopted %d",
+	line2 := fmt.Sprintf("Msgs %d/%d (%s)   Progress %s   Rate %s/s (%.1f msg/s)   New %d   Adopted %d",
 		agg.MsgsDone, agg.MsgsTotal, util.Pct(agg.MsgsDone, agg.MsgsTotal),
 		util.FmtBytes(float64(agg.BytesDone)), util.FmtBytes(br), mr, agg.Appended, agg.Adopted)
 	if agg.FailedMsgs > 0 {
@@ -486,14 +879,25 @@ func (m *Model) popupBox(w, h int) string {
 	if inner > w-6 {
 		inner = w - 6
 	}
+	// A live popup is re-rendered from the CURRENT snapshot every frame; a
+	// static one shows what it captured when it opened.
+	body := m.popup.Lines
+	live := m.popup.Live != ""
+	if live {
+		body = m.mailboxInspector(m.popup.Live)
+	}
 	var lines []string
 	lines = append(lines, cBold.Render(center(m.popup.Title, inner)))
 	lines = append(lines, "")
-	for _, l := range m.popup.Lines {
+	for _, l := range body {
 		lines = append(lines, " "+clip(l, inner-2))
 	}
 	lines = append(lines, "")
-	lines = append(lines, cDim.Render(center("Esc / ⏎ close", inner)))
+	hint := "Esc / ⏎ close"
+	if live {
+		hint = "live — updating · Esc / ⏎ back to the list"
+	}
+	lines = append(lines, cDim.Render(center(hint, inner)))
 	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).
 		Width(inner).Render(strings.Join(lines, "\n"))
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)

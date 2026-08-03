@@ -53,6 +53,14 @@ func FmtBytes(n float64) string {
 }
 
 // FmtDHMS renders "N day HH:MM:SS" exactly like the Python dashboard.
+// It is THE single duration renderer for MailFerry — dashboard, Results,
+// headless summary, reports and attach all use it, so a duration reads
+// identically wherever it appears.
+//
+// The day component is omitted when it is zero. Almost every duration
+// MailFerry shows is under a day, and "0 day 01:32:00" reads like debugging
+// output; "01:32:00" reads like a tool. Longer runs still say "2 days
+// 01:32:00", so nothing is ambiguous.
 func FmtDHMS(secs float64) string {
 	if secs < 0 {
 		secs = 0
@@ -61,7 +69,15 @@ func FmtDHMS(secs float64) string {
 	d := s / 86400
 	h := (s % 86400) / 3600
 	m := (s % 3600) / 60
-	return fmt.Sprintf("%d day %02d:%02d:%02d", d, h, m, s%60)
+	hms := fmt.Sprintf("%02d:%02d:%02d", h, m, s%60)
+	switch d {
+	case 0:
+		return hms
+	case 1:
+		return "1 day " + hms
+	default:
+		return fmt.Sprintf("%d days %s", d, hms)
+	}
 }
 
 // Pct is THE authoritative percentage rendering for message/byte progress

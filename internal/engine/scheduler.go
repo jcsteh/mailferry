@@ -76,6 +76,15 @@ type RunResult struct {
 	Counts         map[string]int
 	Outstanding    int64
 	FailedRegistry []state.FailedRow
+
+	// FinishedAt is the instant the run reached its terminal state —
+	// captured exactly once, here in the engine, when the batch unwinds.
+	// Every consumer (Results TUI, headless summary, reports) renders
+	// this same value; presentation never re-stamps it.
+	FinishedAt time.Time
+	// Interrupted records whether the run ended on a graceful stop
+	// (Ctrl+C / SIGTERM / SIGHUP) rather than by completing its plan.
+	Interrupted bool
 }
 
 type LoggerFactory func(spec config.MailboxSpec) func(string, ...any)
@@ -96,7 +105,7 @@ func RunMigrationBus(ctx context.Context, cfg *config.Run, specs []config.Mailbo
 	defer db.Close()
 	owner := state.LeaseOwnerID()
 	bus.WorkerID = owner
-	db.StartRun(cfg.RunID, cfg.CSVFile)
+	db.StartRun(cfg.RunID, cfg.CSVFile, stats.Mode)
 	// ISO 8601 date-range persistence: the window is DB-wide and first-write
 	// wins, so a resume (fresh RunID, same State DB) applies the identical
 	// selection, and every worker in a cluster converges on one window. Save
@@ -325,7 +334,8 @@ func RunMigrationBus(ctx context.Context, cfg *config.Run, specs []config.Mailbo
 	snap := stats.Snapshot()
 	agg := snap.Agg()
 	res := RunResult{Counts: agg.Counts, Outstanding: db.OutstandingFailed(),
-		FailedRegistry: db.FailedRows(0, true)}
+		FailedRegistry: db.FailedRows(0, true),
+		FinishedAt:     time.Now(), Interrupted: ctx.Err() != nil}
 	result := fmt.Sprintf("ok=%d warnings=%d partial=%d failed=%d stale=%d cancelled=%d",
 		agg.Counts["SUCCESS"], agg.Counts["WARNINGS"], agg.Counts["PARTIAL"],
 		agg.Counts["FAILED"], agg.Counts["STALE"], agg.Counts["CANCELLED"])

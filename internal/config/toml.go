@@ -44,9 +44,35 @@ parallel_mailboxes = 10
 parallel_folders = 3
 # Simultaneous connections allowed per server host (be kind to servers).
 per_host_connections = 8
+# Mailbox admission order: "csv" (file order) or "size" (largest first).
+order = "csv"
+# IMAP MULTIAPPEND (RFC 3502): upload several messages in ONE append
+# command when the DESTINATION server advertises support. This is a
+# transport optimisation - it never changes what is migrated, and a
+# destination without the capability transparently uses one append per
+# message. "auto" uses it whenever it is available; "off" never does
+# (troubleshooting / awkward servers).
+multiappend = "auto"
+# How many messages may be grouped into one MULTIAPPEND command.
+# "auto" sizes each batch from message sizes, an aggregate byte budget,
+# the source fetch pipeline and the concurrency configured above.
+# A fixed count (2-100) overrides it.
+#
+#   IMPORTANT: this is NOT parallel_mailboxes.
+#     parallel_mailboxes      = mailboxes migrated CONCURRENTLY
+#     multiappend_batch_size  = messages grouped into ONE append command
+multiappend_batch_size = "auto"
+# Skip mailboxes already recorded SUCCESS in the State Database.
+skip_completed = false
 # Every APPEND is confirmed via APPENDUID / destination probe before a
 # message is marked done. Always on — recorded here for transparency.
 verify_after_copy = true
+
+[network]
+# Per-connection inactivity watchdog in seconds.
+timeout_seconds = 120
+# COMPRESS=DEFLATE when the server offers it: "auto" or "off".
+compress = "auto"
 
 [retry]
 # Attempts per batch level during failure isolation (see [recovery]).
@@ -103,6 +129,70 @@ heartbeat_seconds = 15
 worker_timeout_seconds = 60
 # Hard cap for any unexplained lease left in the State Database.
 lock_timeout_seconds = 300
+
+# ---------------------------------------------------------------------------
+# OAuth 2.0 / modern authentication (optional)
+# ---------------------------------------------------------------------------
+# The easiest way to create these profiles is the auth command, which
+# authorises in the browser (or headless) and stores the secret in your OS
+# keychain automatically:
+#     mailferry auth add microsoft365 --name client-a --client-id <guid> --tenant <tenant>
+#     mailferry auth add google        --name gmail-a  --client-id <id> --client-secret env:SECRET
+#     mailferry auth list | show | test | refresh | remove
+# See docs/OAUTH.md. You can also write [oauth.<name>] sections by hand.
+#
+# Reference a profile from the CSV by putting "oauth:<name>" in that
+# endpoint's password column — the canonical 10-column CSV is otherwise
+# unchanged. Source and destination auth are independent.
+#
+# SECRETS ARE NEVER STORED HERE. client_secret / refresh_token / access_token
+# / key_json hold an external secret *reference*, never a literal value:
+#     env:VAR_NAME             an environment variable
+#     file:/path/to/secret     a file (0600 recommended)
+#     keychain:SERVICE[/ACCT]  the OS keychain (macOS security / Linux secret-tool)
+#     cmd:program args         stdout of a command
+# MailFerry resolves the reference at run time and never writes the secret to
+# the State Database, logs, reports or traces. A literal secret is rejected.
+#
+# kind = delegated (default)  one user's own mailbox (interactive sign-in)
+# kind = application          Microsoft 365 app-only: one app -> many mailboxes
+# kind = service_account      Google domain-wide delegation -> many mailboxes
+#
+# Delegated Microsoft 365 (SASL XOAUTH2, outlook.office365.com:993):
+# [oauth.client-a]
+# provider = "microsoft"
+# tenant = "common"                 # or your tenant GUID / domain
+# client_id = "00000000-0000-0000-0000-000000000000"
+# refresh_token = "keychain:mailferry/client-a"
+#
+# Delegated Google / Gmail (SASL XOAUTH2, imap.gmail.com:993):
+# [oauth.gmail-a]
+# provider = "google"
+# client_id = "xxxxx.apps.googleusercontent.com"
+# client_secret = "env:MAILFERRY_GOOGLE_SECRET"
+# refresh_token = "file:/etc/mailferry/gmail.refresh"
+#
+# Bulk Microsoft 365 (one tenant app -> many mailboxes, IMAP.AccessAsApp):
+# [oauth.tenant-bulk]
+# provider = "microsoft"
+# kind = "application"
+# tenant = "example.com"
+# client_id = "00000000-0000-0000-0000-000000000000"
+# client_secret = "keychain:mailferry/tenant-bulk"
+#
+# Bulk Google Workspace (service account + domain-wide delegation):
+# [oauth.ws-bulk]
+# provider = "google"
+# kind = "service_account"
+# key_json = "file:/etc/mailferry/service-account.json"
+#
+# Any standards-compliant OAuth IMAP server (explicit endpoints):
+# [oauth.custom]
+# provider = "generic"
+# token_url = "https://id.example.com/oauth2/token"
+# client_id = "mailferry"
+# refresh_token = "env:MAILFERRY_CUSTOM_REFRESH"
+# # mechanism = "OAUTHBEARER"        # default is XOAUTH2
 `
 
 // DefaultTOMLPath is the native per-OS configuration location
@@ -313,74 +403,38 @@ func LoadTOML(r *Run, explicit string, generate bool) ([]string, string, bool) {
 		}
 	}
 
-	num := func(v any) (float64, bool) {
-		switch x := v.(type) {
-		case int64:
-			return float64(x), true
-		case float64:
-			return x, true
-		}
-		return 0, false
+	// Apply values through the ONE typed option catalogue (options.go) —
+	// the same accessors, bounds and validation the F9 Settings editor and
+	// `mailferry config` use, so the interfaces can never drift apart. The
+	// few entries below the catalogue are structural (paths) or accepted
+	// for transparency, not tunables.
+	catalog := map[string]Option{}
+	for _, o := range Catalog() {
+		catalog[o.Name()] = o
 	}
-	setInt := func(dst *int, v any, min float64) bool {
-		if f, ok := num(v); ok && f >= min {
-			*dst = int(f)
-			return true
-		}
-		return false
-	}
-	setF := func(dst *float64, v any, min float64) bool {
-		if f, ok := num(v); ok && f >= min {
-			*dst = f
-			return true
-		}
-		return false
-	}
-	setB := func(dst *bool, v any) bool {
-		if b, ok := v.(bool); ok {
-			*dst = b
-			return true
-		}
-		return false
-	}
-
 	for sect, body := range tree {
+		// [oauth.<name>] sections are authentication profiles, parsed
+		// separately by LoadOAuthProfiles — not tunables. Skip them here so
+		// they never raise "unknown setting" warnings.
+		if sect == "oauth" || strings.HasPrefix(sect, "oauth.") {
+			continue
+		}
 		for key, val := range body {
 			full := sect + "." + key
+			if o, found := catalog[full]; found {
+				if !o.Set(r, val) {
+					warns = append(warns, fmt.Sprintf(
+						"config: %s = %v invalid — using the default", full, val))
+				}
+				continue
+			}
 			ok := true
 			switch full {
-			case "migration.parallel_mailboxes":
-				ok = setInt(&r.Workers, val, 1)
-			case "migration.parallel_folders":
-				ok = setInt(&r.MaxConnsPerBox, val, 1)
-			case "migration.per_host_connections":
-				ok = setInt(&r.PerHostConns, val, 1)
 			case "migration.verify_after_copy":
-				var x bool
-				ok = setB(&x, val) // always on; accepted for transparency
-			case "retry.batch_attempts":
-				ok = setInt(&r.BatchAttempts, val, 1)
-			case "retry.message_attempts":
-				ok = setInt(&r.MsgRetries, val, 1)
-			case "retry.reconnect_attempts":
-				ok = setInt(&r.ReconnectAttempts, val, 1)
-			case "retry.mailbox_attempts":
-				ok = setInt(&r.Retries, val, 0)
-			case "retry.retry_delay":
-				ok = setF(&r.RetryDelay, val, 1)
+				_, ok = val.(bool) // always on; accepted for transparency
 			case "retry.reconnect_backoff":
 				s, isS := val.(string)
 				ok = isS && s == "exponential"
-			case "recovery.isolate_failed_messages":
-				ok = setB(&r.IsolateFailed, val)
-			case "recovery.skip_known_failed_messages":
-				ok = setB(&r.SkipKnownFailed, val)
-			case "recovery.stale_timeout_seconds":
-				ok = setF(&r.StaleTimeout, val, 0)
-			case "recovery.recovery_retries":
-				ok = setInt(&r.RecoveryRetries, val, 1)
-			case "recovery.recovery_interval_seconds":
-				ok = setF(&r.RecoveryInterval, val, 1)
 			case "database.path":
 				sv, isS := val.(string)
 				if ok = isS; ok && sv != "" {
@@ -391,25 +445,8 @@ func LoadTOML(r *Run, explicit string, generate bool) ([]string, string, bool) {
 				if ok = isS2; ok && sv2 != "" {
 					r.LogsDir = sv2
 				}
-			case "logging.level":
-				s, isS := val.(string)
-				if ok = isS && (s == "info" || s == "debug" || s == "trace"); ok {
-					r.Debug = r.Debug || s == "debug"
-					r.Trace = r.Trace || s == "trace"
-				}
-			case "logging.keep_days":
-				ok = setInt(&r.LogKeepDays, val, 0)
-			case "dashboard.refresh_ms":
-				ok = setInt(&r.RefreshMS, val, 50)
 			case "dashboard.show_transfer_speed":
-				var x bool
-				ok = setB(&x, val)
-			case "database.heartbeat_seconds":
-				ok = setF(&r.DBHeartbeat, val, 5)
-			case "database.worker_timeout_seconds":
-				ok = setF(&r.WorkerTimeout, val, 20)
-			case "database.lock_timeout_seconds":
-				ok = setF(&r.LockTimeout, val, 30)
+				_, ok = val.(bool)
 			default:
 				warns = append(warns, fmt.Sprintf(
 					"config: unknown setting '%s' ignored (kept for forward compatibility)", full))
