@@ -12,7 +12,7 @@ binary speaks IMAP directly to both servers, streams messages
 source-to-destination with bounded memory, and records per-message state
 in an SQLite database so every run is resumable and duplicate-free.
 
-> **Release status: `v2.1.0` (latest stable).**
+> **Release status: `v2.1.1` (latest stable).**
 > v1.0.0 was the original Python implementation; development continued
 > unreleased after it and served as the behavioural reference for the
 > complete native Go rewrite that is v2, released as stable v2.0.0
@@ -146,8 +146,8 @@ checksum, make it executable, run it. There is nothing else to install.
 
 ```sh
 shasum -a 256 -c SHA256SUMS          # verify (macOS: shasum, Linux: sha256sum)
-chmod +x mailferry-v2.1.0-darwin-arm64
-./mailferry-v2.1.0-darwin-arm64 version
+chmod +x mailferry-v2.1.1-darwin-arm64
+./mailferry-v2.1.1-darwin-arm64 version
 ```
 
 Targets: `darwin-arm64` (all Apple Silicon), `darwin-amd64` (Intel Macs),
@@ -202,6 +202,8 @@ passwords into its State Database, logs or reports.
 --compress auto|off    COMPRESS=DEFLATE (default auto)
 --multiappend auto|off            batched IMAP appends (default auto)
 --multiappend-batch-size auto|N   messages per append command (NOT --workers)
+--retry-failed         retry Failed Message Registry entries in THIS run only
+                       (the retry-failed command re-queues them permanently)
 --no-tui               headless output   --trace  redacted protocol trace
 ```
 
@@ -318,8 +320,18 @@ state.
   runs, and finishes the mailbox as **COMPLETED WITH WARNINGS** — a few
   bad messages never hold the other thousands hostage.
 - Inspect and manage: `mailferry failed` (list/export `--json`/`--csv`,
-  silence with `--ignore`), `mailferry retry-failed` re-queues entries;
-  successes become RECOVERED.
+  silence with `--ignore`). Successes become RECOVERED; repeat failures
+  return to the registry with an incremented failure count.
+- **Two ways to retry**, deliberately distinct:
+
+  | | What it does |
+  |---|---|
+  | `mailferry retry-failed` | **Permanent.** A State Database operation: resets the selected messages to planned and marks the registry RETRY_PENDING, so they rejoin *every* future run. Scope with `--mailbox` / `--folder` / `--uid`. |
+  | `mailferry run CSV --retry-failed` | **This run only.** A scheduling override that admits failed messages to the work queue. Nothing is rewritten up front — the registry and State Database are touched only as each message is actually retried. |
+
+  Reach for the flag when you have just fixed a server and want one
+  attempt; reach for the command when the messages should be treated as
+  ordinary work from now on.
 
 ## Troubleshooting the terminal
 

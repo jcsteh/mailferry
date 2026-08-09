@@ -92,8 +92,13 @@ reconnect_backoff = "exponential"
 # Progressively isolate messages that repeatedly break the transfer
 # (batch -> halves -> single) instead of retrying the same batch forever.
 isolate_failed_messages = true
-# Skip messages already recorded in the Failed Message Registry on
-# future runs ("mailferry retry-failed" re-queues them explicitly).
+# Exclude messages already recorded in the Failed Message Registry from
+# the work queue, so one poison message cannot stall every future run.
+# Setting this to false is the persistent equivalent of running with
+# --retry-failed: failed messages are attempted again, but nothing is
+# rewritten in the State Database merely because the setting is off.
+# To re-queue messages PERMANENTLY instead, use "mailferry retry-failed",
+# which resets them to planned and marks the registry RETRY_PENDING.
 skip_known_failed_messages = true
 # Mark a mailbox stalled after this long without measurable progress
 # and recover it automatically (0 disables the supervisor).

@@ -44,7 +44,7 @@ operation (or explicit `mailferry config`) — see [section 5](#5-where-mailferr
 
 ## 3. macOS Gatekeeper
 
-**Current releases (v2.1.0 included):** MailFerry's macOS binaries are
+**All current releases:** MailFerry's macOS binaries are
 not yet Apple-notarised — the Developer ID signing pipeline is documented
 in docs/RELEASING-MACOS.md and planned for a future release — so
 Gatekeeper may block the first launch. This is expected and is not a

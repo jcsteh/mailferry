@@ -43,7 +43,7 @@ import "fmt"
 
 const (
 	// Core is the semantic version: MAJOR.MINOR.PATCH, nothing else.
-	Core = "2.1.0"
+	Core = "2.1.1"
 	// Stage is the release stage — "dev", "alpha1", "beta2", "RC1", … —
 	// or "" for a final release. This is the ONLY place it is written.
 	Stage = ""

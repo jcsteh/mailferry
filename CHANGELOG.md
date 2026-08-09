@@ -13,6 +13,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - QRESYNC/CONDSTORE delta sync, permanent quarantine purge,
   Prometheus-style metrics (v2.1.x and beyond).
 
+## [2.1.1] - 2026-08-10
+
+Bug-fix release. No changes to the migration engine's correctness,
+resumability, statistics identity or on-disk schema.
+
+### Fixed
+
+- **`--no-skip-failed` did not do what it said.** It was documented as
+  "do not skip Failed Message Registry entries on resume", but its only
+  effect was suppressing one log line: failed messages are excluded
+  *structurally* (their rows are `failed`, and the transfer selects
+  `planned`), which the flag never touched. An operator could reasonably
+  believe they had re-queued their failures when nothing had changed.
+  No migration-correctness impact — nothing was lost or duplicated, and
+  `mailferry retry-failed` always worked correctly.
+
+### Added
+
+- **`--retry-failed` runtime override.** `mailferry run CSV --retry-failed`
+  admits Failed Message Registry entries to the work queue **for that run
+  only**. It is purely a scheduling decision: the registry and the State
+  Database are not rewritten up front, the rows keep their `failed` state,
+  and normal transitions apply only as each message is actually retried —
+  success flows through the ordinary path to RECOVERED, a repeat failure
+  stays FAILED with an incremented count.
+
+  This restores the intent of the broken flag while keeping a clean
+  separation an operator can reason about:
+
+  | | Meaning |
+  |---|---|
+  | `mailferry retry-failed` (command) | *Permanently* re-queue: a deliberate State Database write, resetting rows to `planned` and the registry to RETRY_PENDING so the messages rejoin every future run. **Unchanged.** |
+  | `run CSV --retry-failed` (flag) | *This execution only.* Runtime flags should influence runtime behaviour, not rewrite persistent migration state. |
+
+- `recovery.skip_known_failed_messages = false` in `mailferry.toml` is the
+  persistent equivalent of the runtime flag, and now genuinely works.
+
+### Changed
+
+- `--no-skip-failed` is retained as a **deprecated alias** for
+  `--retry-failed` through the v2.1.x series, and prints a notice. It will
+  be removed thereafter.
+- CLI help, `mailferry failed` footer, `mailferry retry-failed` output,
+  the configuration template and the README now state the distinction
+  between the permanent command and the one-run flag explicitly.
+
 ## [2.1.0] - 2026-08-03
 
 Feature release: OAuth 2.0 / modern authentication with a first-class
@@ -1005,7 +1051,8 @@ Engine.
   suite (34 checks).
 - Packaging: standalone `mailferry.pyz` (zipapp), source archive, wheel.
 
-[Unreleased]: https://github.com/ajsap/mailferry/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/ajsap/mailferry/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/ajsap/mailferry/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/ajsap/mailferry/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/ajsap/mailferry/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/ajsap/mailferry/compare/v2.0.1...v2.0.2

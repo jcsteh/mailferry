@@ -269,9 +269,15 @@ func (s *folderSyncer) run() (FolderOutcome, error) {
 
 	// ---- transfer ----
 	s.registry = db.RegistryUIDs(s.r.MID, plan.SrcDisplay)
-	if n := db.FolderCounts(fid)["failed"][0]; n > 0 && s.r.Cfg.SkipKnownFailed {
-		s.logf("skipping %d previously failed message(s) — recorded in the Failed "+
-			"Message Registry (mailferry retry-failed re-queues them)", n)
+	if n := db.FolderCounts(fid)["failed"][0]; n > 0 {
+		if s.r.Cfg.SkipKnownFailed {
+			s.logf("skipping %d previously failed message(s) — recorded in the Failed "+
+				"Message Registry (`mailferry retry-failed` re-queues them permanently; "+
+				"`--retry-failed` retries them for one run)", n)
+		} else {
+			s.logf("--retry-failed: including %d previously failed message(s) in this run "+
+				"(registry entries are updated only as each message is actually retried)", n)
+		}
 	}
 	// supervisor hand-off: a stalled transfer that reconnects did not fix
 	// enters Recovery Mode targeting the current front of the queue
@@ -299,7 +305,7 @@ func (s *folderSyncer) run() (FolderOutcome, error) {
 			return out, err
 		}
 	}
-	toCopy := db.RowsByState(fid, "planned")
+	toCopy := s.workQueue(fid)
 	var failures []failedRow
 	if len(toCopy) > 0 {
 		var totalBytes int64
@@ -384,6 +390,58 @@ func (s *folderSyncer) run() (FolderOutcome, error) {
 	}
 	out.OK = true
 	return out, nil
+}
+
+// workQueue is the set of messages this pass will attempt.
+//
+// Normally that is exactly the `planned` rows. A message recorded in the
+// Failed Message Registry is structurally excluded, which is what stops one
+// poison message stalling every future run.
+//
+// THE RUNTIME OVERRIDE (`--retry-failed`, or
+// `recovery.skip_known_failed_messages = false`) additionally admits
+// `failed` rows FOR THIS RUN ONLY. It is deliberately a scheduling decision
+// and nothing else: the rows keep their `failed` state and the registry is
+// untouched until a message is actually retried, at which point the ordinary
+// state machine applies — inflight, then done (registry RECOVERED via
+// markRecoveries) or failed again (fail_count incremented).
+//
+// Contrast `mailferry retry-failed`, the ADMINISTRATIVE command, which is a
+// deliberate State Database operation: it permanently resets rows to
+// `planned` and sets the registry to RETRY_PENDING, so the messages
+// participate in every future run as though they had never failed.
+//
+// Honest consequence worth knowing: if a run using the override is
+// interrupted while a previously-failed message is in flight, the ordinary
+// inflight reconciliation will settle that message as adopted or `planned`.
+// That is a state change caused by genuinely attempting the message, not by
+// passing the flag — and `planned` is the correct, safe outcome for an
+// inconclusive attempt.
+func (s *folderSyncer) workQueue(fid int64) []state.MsgRow {
+	planned := s.r.DB.RowsByState(fid, "planned")
+	if s.r.Cfg.SkipKnownFailed {
+		return planned
+	}
+	failed := s.r.DB.RowsByState(fid, "failed")
+	if len(failed) == 0 {
+		return planned
+	}
+	// Merge in source-UID order. Both inputs are already ordered by
+	// RowsByState, and the transfer relies on a deterministic order for
+	// resume behaviour and for the isolation ladder.
+	out := make([]state.MsgRow, 0, len(planned)+len(failed))
+	i, j := 0, 0
+	for i < len(planned) && j < len(failed) {
+		if planned[i].SrcUID <= failed[j].SrcUID {
+			out = append(out, planned[i])
+			i++
+			continue
+		}
+		out = append(out, failed[j])
+		j++
+	}
+	out = append(out, planned[i:]...)
+	return append(out, failed[j:]...)
 }
 
 // canonFlags: order-independent canonical form for flag comparison — the

@@ -281,7 +281,7 @@ func Catalog() []Option {
 		func(r *Run) any { return r.IsolateFailed },
 		boolSetter(func(r *Run) *bool { return &r.IsolateFailed })))
 	add(opt("recovery", "skip_known_failed_messages", "Skip known failed",
-		"Skip Failed Message Registry entries on future runs (retry-failed re-queues)",
+		"Exclude Failed Message Registry entries from the work queue (false = same as --retry-failed)",
 		KindBool, 0, 0, 0, nil, false,
 		func(r *Run) any { return r.SkipKnownFailed },
 		boolSetter(func(r *Run) *bool { return &r.SkipKnownFailed })))

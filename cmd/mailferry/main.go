@@ -251,7 +251,8 @@ Usage:
   mailferry attach [RUN-ID]      live read-only monitor of a running migration
   mailferry auth ...             OAuth profiles: add / list / show / test / refresh / remove
   mailferry failed               list / export the Failed Message Registry
-  mailferry retry-failed         re-queue registry entries for the next run
+  mailferry retry-failed         permanently re-queue registry entries (State
+                                 Database write; they rejoin every future run)
   mailferry dedup CSV            find/quarantine destination duplicates (safe; --execute)
   mailferry verify CSV           compare per-folder counts: source vs destination vs state
   mailferry capabilities HOST PORT   probe a server's capabilities
@@ -274,6 +275,8 @@ Frequent flags: --workers N --db PATH (native per-user mailferry.db
   --compress auto|off --baseline --tls-no-verify --no-tui --trace --config PATH
   --multiappend auto|off --multiappend-batch-size auto|N
     (batch size groups messages into ONE append command; --workers is concurrency)
+  --retry-failed (retry Failed Message Registry entries in THIS run only;
+    the retry-failed COMMAND instead re-queues them permanently)
   --portable (run entirely from the executable's own directory)
 Run 'mailferry run -h' for the full list.
 
@@ -395,7 +398,8 @@ func cmdRun(cmd string, rest []string) int {
 		recInterval  = fs.Float64("recovery-interval", 0, "Wait between recovery attempts (s)")
 		batchAtt     = fs.Int("batch-attempts", 0, "Attempts per level during failure isolation")
 		noIsolate    = fs.Bool("no-isolate", false, "Disable progressive failed-message isolation")
-		noSkipFailed = fs.Bool("no-skip-failed", false, "Do not skip Failed Message Registry entries on resume")
+		retryFailed  = fs.Bool("retry-failed", false, "Retry Failed Message Registry entries in THIS run only — nothing is rewritten up front (the retry-failed COMMAND re-queues them permanently)")
+		noSkipFailed = fs.Bool("no-skip-failed", false, "Deprecated alias for --retry-failed (removed after the v2.1.x series)")
 	)
 	fs.Var(&include, "include", "Only sync folders matching GLOB (repeatable)")
 	fs.Var(&exclude, "exclude", "Skip folders matching GLOB (repeatable)")
@@ -537,8 +541,15 @@ func cmdRun(cmd string, rest []string) int {
 	if *noIsolate {
 		cfg.IsolateFailed = false
 	}
-	if *noSkipFailed {
+	// Runtime scheduling override: include registry entries in THIS run's
+	// work queue. It deliberately does not touch the registry or the State
+	// Database up front — see engine.folderSyncer.workQueue.
+	if *retryFailed || *noSkipFailed {
 		cfg.SkipKnownFailed = false
+	}
+	if *noSkipFailed {
+		fmt.Fprintln(os.Stderr, progress.C("note: --no-skip-failed is deprecated — "+
+			"use --retry-failed (the alias is kept through the v2.1.x series)", "yellow"))
 	}
 	cfg.CheckOnly = cmd == "check" || cmd == "validate" || *checkF
 	// --dry-run is a full, read-only run: the engine plans, scans and reports
@@ -802,6 +813,7 @@ var cliFlagToOption = map[string]string{
 	"no-retry":               "retry.mailbox_attempts",
 	"retry-delay":            "retry.retry_delay",
 	"no-isolate":             "recovery.isolate_failed_messages",
+	"retry-failed":           "recovery.skip_known_failed_messages",
 	"no-skip-failed":         "recovery.skip_known_failed_messages",
 	"stale-timeout":          "recovery.stale_timeout_seconds",
 	"recovery-retries":       "recovery.recovery_retries",
@@ -1773,8 +1785,9 @@ func cmdFailed(rest []string) int {
 			util.DecodeEllipsize(orDashS(r.Subject), 64),
 			util.DecodeEllipsize(orDashS(r.Sender), 40), r.FailCount, clipS(r.Reason, 80))
 	}
-	fmt.Println(progress.C("\nRetry: mailferry retry-failed [--mailbox USER] · "+
-		"Export: --csv FILE / --json · Silence: --ignore", "cyan"))
+	fmt.Println(progress.C("\nRetry permanently: mailferry retry-failed [--mailbox USER]", "cyan"))
+	fmt.Println(progress.C("Retry once only:   mailferry run CSV --retry-failed", "cyan"))
+	fmt.Println(progress.C("Export: --csv FILE / --json · Silence: --ignore", "cyan"))
 	return 0
 }
 
@@ -1800,9 +1813,11 @@ func cmdRetryFailed(rest []string) int {
 		fmt.Println("no matching registry entries to retry")
 		return 0
 	}
-	fmt.Printf("%d failed message(s) re-queued (RETRY_PENDING).\n", n)
-	fmt.Println("Run the migration again — successes become RECOVERED; repeat " +
-		"failures return to the registry.")
+	fmt.Printf("%d failed message(s) permanently re-queued (RETRY_PENDING).\n", n)
+	fmt.Println("They now rejoin EVERY future run. Run the migration again — successes")
+	fmt.Println("become RECOVERED; repeat failures return to the registry.")
+	fmt.Println(progress.C("For a one-off retry that leaves the State Database alone, "+
+		"use: mailferry run CSV --retry-failed", "cyan"))
 	return 0
 }
 
