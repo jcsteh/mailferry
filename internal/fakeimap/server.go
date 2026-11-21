@@ -226,6 +226,7 @@ type Server struct {
 	DropAfterOKN  atomic.Int64 // kill AFTER sending OK for the Nth append (ack-loss test)
 	StallAfterN   atomic.Int64 // after N body fetches, stop responding (hung server)
 	StallOnce     atomic.Bool  // clear StallAfterN after the first stall (recover next conn)
+	StallBody     []byte       // bodies containing this never begin their FETCH literal
 	// MULTIAPPEND behaviours. NoMultiAppend hides the capability entirely;
 	// MultiAppendBroken advertises it and then rejects it, which is the
 	// dangerous "server lied" case MailFerry must survive without
@@ -614,7 +615,10 @@ func (s *Server) client(conn net.Conn) {
 						sendRaw([]byte(")\r\n"))
 					} else if wantBody {
 						n := s.FetchBodyN.Add(1)
-						if sa := s.StallAfterN.Load(); sa > 0 && n > sa {
+						stallAfter := s.StallAfterN.Load()
+						shouldStall := (len(s.StallBody) > 0 && bytes.Contains(m.Body, s.StallBody)) ||
+							(stallAfter > 0 && n > stallAfter)
+						if shouldStall {
 							s.StallCount.Add(1)
 							if s.StallOnce.Load() {
 								s.StallAfterN.Store(0) // next connection recovers

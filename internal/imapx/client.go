@@ -43,6 +43,16 @@ type ConnLost struct{ Msg string }
 
 func (e *ConnLost) Error() string { return e.Msg }
 
+// BodyTimeout identifies a FETCH whose body literal did not begin before the
+// configured inactivity deadline.  It remains transport-shaped so existing
+// callers reconnect, but lets recovery distinguish a repeatable bad body from
+// unrelated source connection failures.
+type BodyTimeout struct{}
+
+func (e *BodyTimeout) Error() string { return "timed out waiting for message body" }
+
+func (e *BodyTimeout) Unwrap() error { return &ConnLost{Msg: e.Error()} }
+
 type CommandErr struct {
 	Name, Status, Text string
 	Code               []any
@@ -57,6 +67,13 @@ func (e *AuthErr) Error() string { return "authentication failure: " + e.Text }
 func IsConnLost(err error) bool {
 	var c *ConnLost
 	return errors.As(err, &c)
+}
+
+// IsBodyTimeout reports a source FETCH which did not produce its message
+// literal before the configured deadline.
+func IsBodyTimeout(err error) bool {
+	var timeout *BodyTimeout
+	return errors.As(err, &timeout)
 }
 
 // IsDryRunBlocked reports whether err is the sentinel returned when a mutating
@@ -111,7 +128,7 @@ func (b *BodyHandle) WaitSize(timeout time.Duration) (int64, error) {
 	case err := <-b.errCh:
 		return 0, err
 	case <-time.After(timeout):
-		return 0, &ConnLost{"timed out waiting for message body"}
+		return 0, &BodyTimeout{}
 	}
 }
 

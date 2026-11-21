@@ -157,6 +157,42 @@ func TestStaleRecoveryAutoResumes(t *testing.T) {
 	}
 }
 
+func TestSourceBodyTimeoutIsolatedAndRecorded(t *testing.T) {
+	srcA := fakeimap.NewAccount("body-timeout", "p")
+	for i := 0; i < 6; i++ {
+		marker := "OK"
+		if i == 3 {
+			marker = "BODYTIMEOUT"
+		}
+		srcA.Folder("INBOX").Add(poisonBody(i, marker), nil, "17-Jul-2026 10:00:00 +0000")
+	}
+	dstA := fakeimap.NewAccount("body-timeout", "p")
+	h := newHarness(t, srcA, dstA)
+	h.src.StallBody = []byte("BODYTIMEOUT")
+
+	counts := h.run(func(c *config.Run) {
+		c.Workers = 1
+		c.Timeout = 0.05
+		c.StaleTimeout = 0
+		c.FetchWindow = 1
+		c.AppendWindow = 1
+		c.BatchAttempts = 2
+		c.ReconnectAttempts = 5
+	})
+	if counts["WARNINGS"] != 1 {
+		t.Fatalf("want WARNINGS, got %v (%v)", counts, tail(h.sessions, 16))
+	}
+	if n := len(dstA.Folder("INBOX").Msgs); n != 5 {
+		t.Fatalf("healthy messages delivered: %d (want 5)", n)
+	}
+	if reg := readRegistry(t, h.cfg.DBPath); reg[4] != "TIMEOUT" {
+		t.Fatalf("UID 4 failure = %q, want TIMEOUT: %v", reg[4], reg)
+	}
+	if !h.logContains("Recovery Mode") {
+		t.Fatalf("source timeout did not enter Recovery Mode: %v", tail(h.sessions, 16))
+	}
+}
+
 func readRegistry(t *testing.T, dbPath string) map[uint32]string {
 	con, err := sql.Open("sqlite", dbPath)
 	if err != nil {

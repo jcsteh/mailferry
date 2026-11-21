@@ -62,16 +62,17 @@ func cleanFlags(flags string, stripKeywords bool) string {
 }
 
 type folderSyncer struct {
-	r          *MailboxRunner
-	plan       FolderPlan
-	fid        int64
-	src        *imapx.Client
-	dst        *imapx.Client
-	rec        *poisonRec
-	registry   map[uint32]string
-	copied     []uint32
-	lastAppUID uint32
-	lossPhase  string // "fetch" (source) | "append" (destination)
+	r            *MailboxRunner
+	plan         FolderPlan
+	fid          int64
+	src          *imapx.Client
+	dst          *imapx.Client
+	rec          *poisonRec
+	registry     map[uint32]string
+	copied       []uint32
+	lastAppUID   uint32
+	lastFetchUID uint32
+	lossPhase    string // "fetch" (source) | "append" (destination)
 	// MULTIAPPEND telemetry for this folder — secondary information only.
 	// Message statistics never come from here.
 	maCommands int64
@@ -871,7 +872,8 @@ func (s *folderSyncer) transferPass(rows []state.MsgRow, stripKeywords bool,
 			if err := startMore(); err != nil {
 				return fail(err)
 			}
-			s.lossPhase = "fetch" // a loss here blames the source
+			s.lossPhase = "fetch" // a loss here usually blames the source
+			s.lastFetchUID = item.row.SrcUID
 			size, err := item.bh.WaitSize(time.Duration(cfg.Timeout * float64(time.Second)))
 			if err != nil {
 				if imapx.IsConnLost(err) {
@@ -1144,21 +1146,29 @@ func (s *folderSyncer) notePass(rows []state.MsgRow, failures []failedRow) {
 
 // noteTransportLoss distinguishes transport trouble (retry the same batch
 // after reconnecting) from a poison message (repeated deaths on the same
-// window -> Recovery Mode). Source-side losses never blame a message.
+// window -> Recovery Mode). A source body timeout is the exception: repeating
+// it for one UID is evidence that that message must be isolated.
 func (s *folderSyncer) noteTransportLoss(err error) {
 	if !s.r.Cfg.IsolateFailed || !imapx.IsConnLost(err) && !imapx.IsStaleKick(err) {
 		return
 	}
-	if s.lossPhase != "append" {
+	bodyTimeout := s.lossPhase == "fetch" && imapx.IsBodyTimeout(err)
+	if s.lossPhase != "append" && !bodyTimeout {
 		return
 	}
 	rec := s.rec
 	window := map[uint32]bool{}
-	for _, r := range s.r.DB.RowsByState(s.fid, "inflight") {
-		window[r.SrcUID] = true
-	}
-	if s.lastAppUID != 0 {
-		window[s.lastAppUID] = true
+	if bodyTimeout {
+		if s.lastFetchUID != 0 {
+			window[s.lastFetchUID] = true
+		}
+	} else {
+		for _, r := range s.r.DB.RowsByState(s.fid, "inflight") {
+			window[r.SrcUID] = true
+		}
+		if s.lastAppUID != 0 {
+			window[s.lastAppUID] = true
+		}
 	}
 	if len(window) == 0 {
 		return
@@ -1198,6 +1208,9 @@ func (s *folderSyncer) noteTransportLoss(err error) {
 		}
 		sortU32(suspects)
 		prime := s.lastAppUID
+		if bodyTimeout {
+			prime = s.lastFetchUID
+		}
 		if rec.suspects[prime] && len(suspects) > 1 {
 			rest := make([]uint32, 0, len(suspects)-1)
 			for _, u := range suspects {
@@ -1260,15 +1273,20 @@ func (s *folderSyncer) isolationPhase(out *FolderOutcome) error {
 		failures, err := s.transferPass(rows, true, out)
 		if err != nil {
 			rec.isoLosses++
-			if s.lossPhase != "append" {
+			bodyTimeout := s.lossPhase == "fetch" && imapx.IsBodyTimeout(err)
+			if s.lossPhase != "append" && !bodyTimeout {
 				return err // source/transport loss: never message evidence
 			}
 			entry.tries++
 			if len(rows) == 1 {
 				if entry.tries >= s.r.Cfg.BatchAttempts {
-					s.permanentFail(rows[0], "CONNECTION_RESET",
-						fmt.Sprintf("server drops the connection on this message (%d attempts)",
-							entry.tries), out)
+					ftype := "CONNECTION_RESET"
+					reason := fmt.Sprintf("server drops the connection on this message (%d attempts)", entry.tries)
+					if bodyTimeout {
+						ftype = "TIMEOUT"
+						reason = fmt.Sprintf("source timed out waiting for this message body (%d attempts)", entry.tries)
+					}
+					s.permanentFail(rows[0], ftype, reason, out)
 					rec.ladder = rec.ladder[1:]
 				}
 			} else if entry.tries >= s.r.Cfg.BatchAttempts {
@@ -1338,6 +1356,9 @@ func (s *folderSyncer) permanentFail(row state.MsgRow, ftype, reason string,
 	s.r.DB.RecordFailed(s.r.MID, s.plan.SrcDisplay, uid, msgID, subj, sender,
 		date, row.Size, ftype, reason)
 	s.r.DB.MarkState(s.fid, []uint32{uid}, "failed", trunc(reason, 200))
+	if s.lastFetchUID == uid {
+		s.lastFetchUID = 0
+	}
 	s.r.MB.Add(func(m *MBValues) { m.FailedMsgs++ })
 	out.Failed++
 	delete(s.rec.noCounts, uid)
