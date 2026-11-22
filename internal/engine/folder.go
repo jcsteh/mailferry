@@ -280,6 +280,11 @@ func (s *folderSyncer) run() (FolderOutcome, error) {
 				"(registry entries are updated only as each message is actually retried)", n)
 		}
 	}
+	// A final isolated message must reconnect before the remaining queue can
+	// continue. Complete that recovery episode on the clean re-entry.
+	if len(s.rec.ladder) == 0 && s.rec.announced {
+		s.completeRecovery(db.FolderCounts(fid)["failed"][0])
+	}
 	// supervisor hand-off: a stalled transfer that reconnects did not fix
 	// enters Recovery Mode targeting the current front of the queue
 	if s.r.Bus != nil && s.r.Cfg.IsolateFailed && len(s.rec.ladder) == 0 &&
@@ -1124,6 +1129,18 @@ func (s *folderSyncer) announceRecovery(n int) {
 		fmt.Sprintf("repeated failures — isolating %d suspect message(s)", n))
 }
 
+func (s *folderSyncer) completeRecovery(failed int64) {
+	s.rec.losses = 0
+	s.rec.suspects = map[uint32]bool{}
+	if !s.rec.announced {
+		return
+	}
+	s.rec.announced = false
+	s.logf("Recovery Mode complete — continuing migration")
+	s.hist("Migration resumed", "OK",
+		fmt.Sprintf("continuing remaining messages (%d failed message(s) recorded)", failed))
+}
+
 // notePass: deterministic (tagged NO) failures accumulate per UID across
 // reconnect re-entries; a fully clean pass clears the suspicion state.
 func (s *folderSyncer) notePass(rows []state.MsgRow, failures []failedRow) {
@@ -1326,15 +1343,7 @@ func (s *folderSyncer) isolationPhase(out *FolderOutcome) error {
 			}
 		}
 	}
-	rec.losses = 0
-	rec.suspects = map[uint32]bool{}
-	if rec.announced {
-		rec.announced = false
-		s.logf("Recovery Mode complete — continuing migration")
-		s.hist("Migration resumed", "OK",
-			fmt.Sprintf("continuing remaining messages (%d failed message(s) recorded)",
-				out.Failed))
-	}
+	s.completeRecovery(out.Failed)
 	return nil
 }
 

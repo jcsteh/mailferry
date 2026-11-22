@@ -664,6 +664,13 @@ func (r *MailboxRunner) syncFolderWithReconnect(plan FolderPlan) error {
 		staleKick := imapx.IsStaleKick(err)
 		rec := r.poisonFor(plan.SrcDisplay)
 		isolating := len(rec.ladder) > 0
+		isolated := outcome.Failed > 0
+		if isolated {
+			// A permanently recorded message is real forward progress. Start a
+			// fresh reconnect episode for the remaining queue rather than letting
+			// the retries spent finding this message abandon the whole folder.
+			rc = 0
+		}
 		if staleKick && r.Bus != nil && r.Bus.IsStaleFailed(r.Spec.Label()) {
 			return errStaleFailed
 		}
@@ -671,6 +678,9 @@ func (r *MailboxRunner) syncFolderWithReconnect(plan FolderPlan) error {
 		switch {
 		case staleKick:
 			// supervisor kicks never consume the reconnect budget
+		case isolated:
+			// the timed-out connection still needs replacing, but the just
+			// completed isolation must not consume a fresh episode's budget
 		case isolating && rec.isoLosses <= 60:
 			// isolation losses are the ladder doing its job
 		default:

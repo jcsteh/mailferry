@@ -193,6 +193,42 @@ func TestSourceBodyTimeoutIsolatedAndRecorded(t *testing.T) {
 	}
 }
 
+func TestSourceBodyTimeoutRecoveryResetsReconnectBudget(t *testing.T) {
+	srcA := fakeimap.NewAccount("body-timeout-reset", "p")
+	for i := 0; i < 6; i++ {
+		marker := "OK"
+		if i == 1 || i == 4 {
+			marker = "BODYTIMEOUT"
+		}
+		srcA.Folder("INBOX").Add(poisonBody(i, marker), nil, "17-Jul-2026 10:00:00 +0000")
+	}
+	dstA := fakeimap.NewAccount("body-timeout-reset", "p")
+	h := newHarness(t, srcA, dstA)
+	h.src.StallBody = []byte("BODYTIMEOUT")
+
+	counts := h.run(func(c *config.Run) {
+		c.Workers = 1
+		c.Timeout = 0.05
+		c.StaleTimeout = 0
+		c.FetchWindow = 1
+		c.AppendWindow = 1
+		c.BatchAttempts = 2
+		c.ReconnectAttempts = 2
+	})
+	if counts["WARNINGS"] != 1 {
+		t.Fatalf("want WARNINGS after two isolated timeouts, got %v (%v)", counts, tail(h.sessions, 20))
+	}
+	if n := len(dstA.Folder("INBOX").Msgs); n != 4 {
+		t.Fatalf("healthy messages delivered: %d (want 4)", n)
+	}
+	if reg := readRegistry(t, h.cfg.DBPath); reg[2] != "TIMEOUT" || reg[5] != "TIMEOUT" {
+		t.Fatalf("timeout registry = %v, want UIDs 2 and 5", reg)
+	}
+	if !h.logContains("Recovery Mode complete") {
+		t.Fatalf("recovery completion was not logged: %v", tail(h.sessions, 20))
+	}
+}
+
 func readRegistry(t *testing.T, dbPath string) map[uint32]string {
 	con, err := sql.Open("sqlite", dbPath)
 	if err != nil {
